@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/pip install:*)",
+      "Bash(.venv/Scripts/python:*)",
+      "WebFetch(domain:www.openphone.com)",
+      "WebFetch(domain:www.quo.com)"
+    ]
+  }
+}

@@ -1,0 +1,10 @@
+﻿.env
+*.env
+
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+failed_items*.json
+test_json*.json
