@@ -109,7 +109,11 @@ By default it listens on `http://0.0.0.0:8080/op_new_message`.
 
 ```bash
 OPENPHONE_WEBHOOK_BASE_URL=https://your-public-domain
+OPENPHONE_WEBHOOK_SIGNING_SECRET=your_base64_signing_secret
 ```
+
+`OPENPHONE_WEBHOOK_SIGNING_SECRET` should be the webhook signing key from OpenPhone/Quo.
+The receiver now verifies the `openphone-signature` header before processing events.
 
 3. Create (or reuse) the webhook in OpenPhone:
 

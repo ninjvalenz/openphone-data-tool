@@ -80,6 +80,11 @@ class OpenPhoneWebhookService(OpenPhoneService):
         if existing:
             return existing
 
+        # TODO: Alert a Discord channel when webhook health check fails and we
+        # need to recreate the webhook.
+        # TODO: Alternative approach: automate secret rotation by saving the new
+        # webhook signing key to a password/secret manager (for example
+        # 1Password Connect, HashiCorp Vault, AWS Secrets Manager, or Doppler).
         return await self.create_message_received_webhook(
             webhook_url=webhook_url,
             label=label,
