@@ -138,7 +138,7 @@ async def _fetch_calls_and_transcripts(
     call_task_meta = []  # track which conversation each task belongs to
     for conv in conversations:
         if not conv.participants:
-            logger.info("  Skipping conversation %s — no participants", conv.id)
+            logger.info("Skipping conversation with no participants.")
             continue
         call_tasks.append(
             service.get_all_calls_by_phonenumber(conv.phoneNumberId, conv.participants)
@@ -246,7 +246,7 @@ async def _process_user(
          b. Fetch messages for all phone numbers (parallel)
       3. Build UserPhoneData dict.
     """
-    logger.info("Processing user: %s %s (%s)", user.firstName, user.lastName, user.id)
+    logger.info("Processing user record.")
 
     # Step 1 — Phone numbers for this user
     try:
@@ -267,7 +267,7 @@ async def _process_user(
     phone_number_ids = [pn.id for pn in phone_numbers]
 
     if not phone_number_ids:
-        logger.info("  No phone numbers for user %s", user.id)
+        logger.info("No phone numbers found for this user.")
         return UserPhoneData(user=user.to_dict()).to_dict()
 
     # Step 2 — Conversations (batched) + calls/transcripts  AND  messages in parallel
@@ -364,13 +364,12 @@ async def generate_phone_data_transactions(
             json.dump(consolidated.to_dict(), f, indent=2, default=str)
 
         logger.info(
-            "Done! Wrote %d users, %d conversations, %d calls, %d messages, %d transcripts to %s",
+            "Done! Wrote %d users, %d conversations, %d calls, %d messages, %d transcripts.",
             len(users),
             total_conversations,
             total_calls,
             total_messages,
             total_transcripts,
-            output_path,
         )
 
         # Step 4 — Write failed items if any
