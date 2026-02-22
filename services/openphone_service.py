@@ -114,7 +114,13 @@ class OpenPhoneService:
     # ------------------------------------------------------------------ #
     #  Internal helpers
     # ------------------------------------------------------------------ #
-    async def _request(self, method: str, endpoint: str, params: dict | None = None) -> dict:
+    async def _request(
+        self,
+        method: str,
+        endpoint: str,
+        params: dict | None = None,
+        json_body: dict | None = None,
+    ) -> dict:
         """
         Central HTTP helper with token-bucket rate limiting, auth-failure
         handling, server-error retry, and 429 back-off as a safety net.
@@ -134,7 +140,12 @@ class OpenPhoneService:
 
             async with self._semaphore:
                 try:
-                    async with self.session.request(method, url, params=params) as resp:
+                    async with self.session.request(
+                        method,
+                        url,
+                        params=params,
+                        json=json_body,
+                    ) as resp:
                         status = resp.status
                         content_type = resp.headers.get("Content-Type", "")
 
