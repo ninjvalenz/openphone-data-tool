@@ -9,11 +9,15 @@ import hmac
 import json
 import logging
 import os
+import queue
+import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from dotenv import load_dotenv
 
+from constants.openphone_webhook_constants import NEW_MESSAGE_WEBHOOK_PATH
+from models.webhook_new_message import WebhookNewMessage
 from services.openphone_webhook_service import OpenPhoneWebhookService
 
 logging.basicConfig(
@@ -22,9 +26,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-WEBHOOK_PATH = "/op_new_message"
+WEBHOOK_PATH = NEW_MESSAGE_WEBHOOK_PATH
 SIGNATURE_HEADER = "openphone-signature"
 DEFAULT_SIGNATURE_TOLERANCE_SECONDS = 300
+DEFAULT_QUEUE_MAXSIZE = 1000
+DEFAULT_WORKER_COUNT = 2
+DEFAULT_ENQUEUE_TIMEOUT_SECONDS = 1.0
 
 
 def _parse_signature_timestamp(timestamp_raw: str) -> int:
@@ -82,9 +89,48 @@ def _verify_signature(
     return False
 
 
+def _process_new_message_event(new_message: WebhookNewMessage) -> None:
+    """
+    Process queued webhook events.
+    """
+    logger.info("Processing queued webhook message.")
+    # TODO: Persist to a durable "webhook_inbox" record first so crashes do not
+    # drop events. Suggested fields:
+    #   - event_id (unique/idempotency key)
+    #   - payload_json
+    #   - received_at
+    #   - status (pending, processed, failed_retryable, failed_terminal)
+    #   - attempt_count
+    #   - last_error
+    # TODO: Process business writes from inbox records in a transaction, and
+    # update status/attempt_count on success or failure.
+    # TODO: Add retry with backoff and dead-letter handling for terminal errors.
+
+
+def _event_worker(
+    event_queue: queue.Queue,
+    stop_event: threading.Event,
+    worker_name: str,
+) -> None:
+    while not stop_event.is_set():
+        try:
+            new_message = event_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+
+        try:
+            _process_new_message_event(new_message)
+        except Exception as exc:
+            logger.exception("Worker %s failed processing queued message: %s", worker_name, exc)
+        finally:
+            event_queue.task_done()
+
+
 class OpenPhoneWebhookHandler(BaseHTTPRequestHandler):
     signing_key_bytes: bytes = b""
     signature_tolerance_seconds: int = DEFAULT_SIGNATURE_TOLERANCE_SECONDS
+    event_queue: queue.Queue = queue.Queue(maxsize=DEFAULT_QUEUE_MAXSIZE)
+    enqueue_timeout_seconds: float = DEFAULT_ENQUEUE_TIMEOUT_SECONDS
 
     def _send_json(self, status_code: int, payload: dict) -> None:
         body = json.dumps(payload).encode("utf-8")
@@ -136,13 +182,18 @@ class OpenPhoneWebhookHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ignored"})
             return
 
-        logger.info("Mapped inbound webhook message: %s", new_message.to_dict())
-        # TODO: Save new_message.to_dict() to the database.
+        try:
+            self.event_queue.put(new_message, timeout=self.enqueue_timeout_seconds)
+        except queue.Full:
+            logger.error("Webhook queue full. Dropping message id=%s", new_message.id)
+            self._send_json(503, {"message": "Webhook queue is full"})
+            return
 
-        self._send_json(200, {"status": "ok"})
+        self._send_json(200, {"status": "queued"})
 
     def log_message(self, fmt: str, *args) -> None:
-        logger.info("%s - %s", self.address_string(), fmt % args)
+        # Avoid INFO-level request details to reduce potential PII in logs.
+        logger.debug("HTTP server - %s", fmt % args)
 
 
 def run_server() -> None:
@@ -177,12 +228,75 @@ def run_server() -> None:
     if tolerance_seconds < 0:
         raise RuntimeError("OPENPHONE_WEBHOOK_SIGNATURE_TOLERANCE_SECONDS must be >= 0.")
 
+    queue_maxsize_raw = os.environ.get(
+        "OPENPHONE_WEBHOOK_QUEUE_MAXSIZE",
+        str(DEFAULT_QUEUE_MAXSIZE),
+    )
+    worker_count_raw = os.environ.get(
+        "OPENPHONE_WEBHOOK_WORKER_COUNT",
+        str(DEFAULT_WORKER_COUNT),
+    )
+    enqueue_timeout_raw = os.environ.get(
+        "OPENPHONE_WEBHOOK_ENQUEUE_TIMEOUT_SECONDS",
+        str(DEFAULT_ENQUEUE_TIMEOUT_SECONDS),
+    )
+
+    try:
+        queue_maxsize = int(queue_maxsize_raw)
+    except ValueError as exc:
+        raise RuntimeError("OPENPHONE_WEBHOOK_QUEUE_MAXSIZE must be an integer.") from exc
+    if queue_maxsize <= 0:
+        raise RuntimeError("OPENPHONE_WEBHOOK_QUEUE_MAXSIZE must be > 0.")
+
+    try:
+        worker_count = int(worker_count_raw)
+    except ValueError as exc:
+        raise RuntimeError("OPENPHONE_WEBHOOK_WORKER_COUNT must be an integer.") from exc
+    if worker_count <= 0:
+        raise RuntimeError("OPENPHONE_WEBHOOK_WORKER_COUNT must be > 0.")
+
+    try:
+        enqueue_timeout_seconds = float(enqueue_timeout_raw)
+    except ValueError as exc:
+        raise RuntimeError("OPENPHONE_WEBHOOK_ENQUEUE_TIMEOUT_SECONDS must be numeric.") from exc
+    if enqueue_timeout_seconds < 0:
+        raise RuntimeError("OPENPHONE_WEBHOOK_ENQUEUE_TIMEOUT_SECONDS must be >= 0.")
+
+    event_queue: queue.Queue = queue.Queue(maxsize=queue_maxsize)
+    stop_event = threading.Event()
+    worker_threads: list[threading.Thread] = []
+    for i in range(worker_count):
+        worker_name = f"webhook-worker-{i + 1}"
+        thread = threading.Thread(
+            target=_event_worker,
+            args=(event_queue, stop_event, worker_name),
+            name=worker_name,
+            daemon=True,
+        )
+        thread.start()
+        worker_threads.append(thread)
+
     OpenPhoneWebhookHandler.signing_key_bytes = signing_key_bytes
     OpenPhoneWebhookHandler.signature_tolerance_seconds = tolerance_seconds
+    OpenPhoneWebhookHandler.event_queue = event_queue
+    OpenPhoneWebhookHandler.enqueue_timeout_seconds = enqueue_timeout_seconds
 
-    server = HTTPServer((host, port), OpenPhoneWebhookHandler)
-    logger.info("Listening on http://%s:%s%s", host, port, WEBHOOK_PATH)
-    server.serve_forever()
+    server = ThreadingHTTPServer((host, port), OpenPhoneWebhookHandler)
+    logger.info(
+        "Webhook receiver is running (workers=%s, queue_maxsize=%s).",
+        worker_count,
+        queue_maxsize,
+    )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("Shutdown requested. Stopping webhook receiver...")
+    finally:
+        server.shutdown()
+        server.server_close()
+        stop_event.set()
+        for thread in worker_threads:
+            thread.join(timeout=1.0)
 
 
 if __name__ == "__main__":

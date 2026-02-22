@@ -98,6 +98,9 @@ class OpenPhoneWebhookService(OpenPhoneService):
         Parse inbound payload as message.received webhook event.
         Returns None for unsupported event types or malformed payloads.
         """
+        if not isinstance(payload, dict):
+            return None
+
         event_type = payload.get("type")
         if event_type != "message.received":
             return None

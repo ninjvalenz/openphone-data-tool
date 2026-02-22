@@ -254,7 +254,7 @@ class OpenPhoneService:
         items = data.get("data", [])
 
         if not items:
-            logger.info("get_phonenumber_by_user: no phone numbers for user %s", user_id)
+            logger.info("get_phonenumber_by_user: no phone numbers found.")
             return []
 
         phone_numbers: List[PhoneNumber] = []
@@ -263,7 +263,7 @@ class OpenPhoneService:
             pn.userId = user_id
             phone_numbers.append(pn)
 
-        logger.info("get_phonenumber_by_user: found %d numbers for user %s", len(phone_numbers), user_id)
+        logger.info("get_phonenumber_by_user: found %d numbers.", len(phone_numbers))
         return phone_numbers
 
     # ------------------------------------------------------------------ #
@@ -286,7 +286,7 @@ class OpenPhoneService:
             items = data.get("data", [])
 
             if not items:
-                logger.info("get_all_conversations: no more records for %s", phone_number_ids)
+                logger.info("get_all_conversations: no more records.")
                 break
 
             for item in items:
@@ -348,7 +348,7 @@ class OpenPhoneService:
                     seen_ids.add(call.id)
                     calls.append(call)
 
-        logger.info("get_all_calls_by_phonenumber: fetched %d calls for %s", len(calls), phone_number_id)
+        logger.info("get_all_calls_by_phonenumber: fetched %d calls.", len(calls))
         return calls
 
     # ------------------------------------------------------------------ #
@@ -373,7 +373,7 @@ class OpenPhoneService:
             items = data.get("data", [])
 
             if not items:
-                logger.info("get_all_messages_by_phonenumber: no more records for %s", phone_number_id)
+                logger.info("get_all_messages_by_phonenumber: no more records.")
                 break
 
             for item in items:
@@ -383,7 +383,7 @@ class OpenPhoneService:
             if not page_token:
                 break
 
-        logger.info("get_all_messages_by_phonenumber: fetched %d messages for %s", len(messages), phone_number_id)
+        logger.info("get_all_messages_by_phonenumber: fetched %d messages.", len(messages))
         return messages
 
     # ------------------------------------------------------------------ #
@@ -399,13 +399,13 @@ class OpenPhoneService:
             data = await self._request("GET", f"call-transcripts/{call_id}")
         except OpenPhoneApiError as exc:
             if exc.status_code == 404:
-                logger.info("get_all_transcripts_by_call: no transcript for call %s", call_id)
+                logger.info("get_all_transcripts_by_call: no transcript found.")
                 return None
             raise
 
         # The API returns the transcript directly (not wrapped in a "data" array)
         if not data:
-            logger.info("get_all_transcripts_by_call: empty transcript for call %s", call_id)
+            logger.info("get_all_transcripts_by_call: empty transcript payload.")
             return None
 
         # Handle both direct object and "data" wrapper for safety
@@ -416,5 +416,5 @@ class OpenPhoneService:
             transcript_data = transcript_data[0]
 
         transcript = Transcript.from_dict(transcript_data)
-        logger.info("get_all_transcripts_by_call: fetched transcript for call %s", call_id)
+        logger.info("get_all_transcripts_by_call: fetched transcript.")
         return transcript

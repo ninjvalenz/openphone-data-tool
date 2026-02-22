@@ -114,6 +114,12 @@ OPENPHONE_WEBHOOK_SIGNING_SECRET=your_base64_signing_secret
 
 `OPENPHONE_WEBHOOK_SIGNING_SECRET` should be the webhook signing key from OpenPhone/Quo.
 The receiver now verifies the `openphone-signature` header before processing events.
+It also queues validated events and processes them asynchronously in worker threads.
+
+Optional queue tuning env vars:
+- `OPENPHONE_WEBHOOK_QUEUE_MAXSIZE` (default: `1000`)
+- `OPENPHONE_WEBHOOK_WORKER_COUNT` (default: `2`)
+- `OPENPHONE_WEBHOOK_ENQUEUE_TIMEOUT_SECONDS` (default: `1`)
 
 3. Create (or reuse) the webhook in OpenPhone:
 

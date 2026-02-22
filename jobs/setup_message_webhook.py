@@ -14,6 +14,7 @@ from typing import List, Optional
 
 from dotenv import load_dotenv
 
+from constants.openphone_webhook_constants import NEW_MESSAGE_WEBHOOK_PATH
 from services.openphone_webhook_service import OpenPhoneWebhookService
 
 logging.basicConfig(
@@ -22,10 +23,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-WEBHOOK_PATH = "op_new_message"
-
-
-def _build_webhook_url(base_url: str, path: str = WEBHOOK_PATH) -> str:
+def _build_webhook_url(base_url: str, path: str = NEW_MESSAGE_WEBHOOK_PATH) -> str:
     return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
 
 
@@ -55,11 +53,8 @@ async def ensure_message_received_webhook(
             resource_ids=resource_ids,
         )
         logger.info(
-            "Webhook ready: id=%s status=%s url=%s events=%s",
-            webhook.get("id"),
+            "Webhook ensure completed successfully (status=%s).",
             webhook.get("status"),
-            webhook.get("url"),
-            webhook.get("events"),
         )
         return webhook
 
@@ -82,8 +77,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--label",
         type=str,
-        default="op_new_message",
-        help="Webhook label (default: op_new_message)",
+        default=NEW_MESSAGE_WEBHOOK_PATH.lstrip("/"),
+        help=f"Webhook label (default: {NEW_MESSAGE_WEBHOOK_PATH.lstrip('/')})",
     )
     parser.add_argument(
         "--user-id",
@@ -110,7 +105,7 @@ if __name__ == "__main__":
             "Missing base URL. Set OPENPHONE_WEBHOOK_BASE_URL or pass --base-url.",
         )
 
-    webhook_url = _build_webhook_url(args.base_url, WEBHOOK_PATH)
+    webhook_url = _build_webhook_url(args.base_url, NEW_MESSAGE_WEBHOOK_PATH)
     resource_ids = _parse_resource_ids(args.resource_ids)
     webhook = asyncio.run(
         ensure_message_received_webhook(
@@ -122,4 +117,4 @@ if __name__ == "__main__":
         )
     )
 
-    logger.info("Ready: webhookId=%s", webhook.get("id"))
+    logger.info("Webhook setup job completed.")
