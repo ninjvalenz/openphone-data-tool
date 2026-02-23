@@ -59,6 +59,33 @@ Fetches users, phone numbers, conversations, calls (with transcripts), and messa
    OPENPHONE_API_KEY=your_actual_api_key
    ```
 
+6. **Configure database connection (dialect-aware)**
+
+   This project now uses a connection strategy based on `DATABASE_URL`, so the
+   same call sites can support SQLite now and PostgreSQL/MSSQL later.
+
+   SQLite example (current local setup):
+
+   ```
+   DATABASE_URL=sqlite:///D:/Development/OLJ-DB/mockOLJ/property_data.db
+   ```
+
+   PostgreSQL example (future):
+
+   ```
+   DATABASE_URL=postgresql+psycopg://user:password@localhost:5432/openphone_data
+   ```
+
+   MSSQL example (future):
+
+   ```
+   DATABASE_URL=mssql+pyodbc://user:password@localhost:1433/openphone_data?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes
+   ```
+
+   Backwards compatibility:
+   - `OLJ_DB_PATH` is still supported as a SQLite-only fallback.
+   - If both are set, `DATABASE_URL` wins.
+
 ## Usage
 
 **Fetch all users:**
@@ -89,6 +116,14 @@ python main.py --failed-output my_failed_items.json
 
 ```bash
 python main.py --max-count 10 --output my_data.json --failed-output my_failed_items.json
+```
+
+## Database Connectivity Check
+
+Run this before wiring write paths, to verify the configured database can be opened:
+
+```bash
+python -m jobs.check_database_connection
 ```
 
 ## Webhook Setup (Inbound SMS)

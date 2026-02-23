@@ -94,17 +94,7 @@ def _process_new_message_event(new_message: WebhookNewMessage) -> None:
     Process queued webhook events.
     """
     logger.info("Processing queued webhook message.")
-    # TODO: Persist to a durable "webhook_inbox" record first so crashes do not
-    # drop events. Suggested fields:
-    #   - event_id (unique/idempotency key)
-    #   - payload_json
-    #   - received_at
-    #   - status (pending, processed, failed_retryable, failed_terminal)
-    #   - attempt_count
-    #   - last_error
-    # TODO: Process business writes from inbox records in a transaction, and
-    # update status/attempt_count on success or failure.
-    # TODO: Add retry with backoff and dead-letter handling for terminal errors.
+    # TODO: Add DB persistence methods incrementally in a dedicated service.
 
 
 def _event_worker(
