@@ -91,6 +91,48 @@ python main.py --failed-output my_failed_items.json
 python main.py --max-count 10 --output my_data.json --failed-output my_failed_items.json
 ```
 
+## Webhook Setup (Inbound SMS)
+
+This project also includes a minimal webhook flow for inbound messages:
+- Local endpoint path: `op_new_message`
+- OpenPhone event subscribed: `message.received` only
+
+1. Start the webhook receiver:
+
+```bash
+python events/openphone_new_message_receiver.py
+```
+
+By default it listens on `http://0.0.0.0:8080/op_new_message`.
+
+2. Expose your local server publicly (for example with ngrok), then set:
+
+```bash
+OPENPHONE_WEBHOOK_BASE_URL=https://your-public-domain
+OPENPHONE_WEBHOOK_SIGNING_SECRET=your_base64_signing_secret
+```
+
+`OPENPHONE_WEBHOOK_SIGNING_SECRET` should be the webhook signing key from OpenPhone/Quo.
+The receiver now verifies the `openphone-signature` header before processing events.
+It also queues validated events and processes them asynchronously in worker threads.
+
+Optional queue tuning env vars:
+- `OPENPHONE_WEBHOOK_QUEUE_MAXSIZE` (default: `1000`)
+- `OPENPHONE_WEBHOOK_WORKER_COUNT` (default: `2`)
+- `OPENPHONE_WEBHOOK_ENQUEUE_TIMEOUT_SECONDS` (default: `1`)
+
+3. Create (or reuse) the webhook in OpenPhone:
+
+```bash
+python -m jobs.setup_message_webhook
+```
+
+Optional arguments:
+- `--base-url` to override `OPENPHONE_WEBHOOK_BASE_URL`
+- `--label` webhook label (default: `op_new_message`)
+- `--resource-ids` comma-separated phone number IDs (`PN...`) or `*`
+- `--user-id` optional OpenPhone user ID
+
 ## Output
 
 The tool produces two files:
