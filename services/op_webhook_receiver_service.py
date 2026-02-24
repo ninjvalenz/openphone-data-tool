@@ -27,8 +27,8 @@ class OpenPhoneWebhookPersistenceService:
         Keep event_type compatible with legacy webhook_inbox CHECK constraints.
         """
         if event_type == "message.received":
-            return "new_message"
-        return event_type or "new_message"
+            return "sms"
+        return event_type or "sms"
 
     def ensure_schema(self) -> None:
         """
@@ -113,7 +113,7 @@ class OpenPhoneWebhookPersistenceService:
         conn.execute(
             """
             UPDATE webhook_inbox
-            SET event_type = 'new_message'
+            SET event_type = 'sms'
             WHERE event_type IS NULL OR event_type = '';
             """
         )
@@ -162,7 +162,7 @@ class OpenPhoneWebhookPersistenceService:
     ) -> int:
         """
         Insert one message event row into webhook_inbox.
-        Incoming `message.received` is normalized to `new_message`
+        Incoming `message.received` is normalized to `sms`
         for compatibility with legacy schemas.
         Returns inserted row id.
         """

@@ -195,6 +195,21 @@ Optional arguments:
 - `--delete-existing` delete matching webhook(s) first, then create/reuse
 - `--delete-only` delete matching webhook(s) and exit
 
+## Webhook Inbox Processing (OpenPhone)
+
+After the receiver writes rows into `webhook_inbox`, run the processor job to
+move `status='unprocessed'` OpenPhone rows into final tables:
+- `openphone_sms_messages`
+- `openphone_phone_numbers`
+
+```bash
+python -m jobs.process_webhook_inbox --limit 100
+```
+
+Optional arguments:
+- `--limit` max rows per run (default: `100`)
+- `--source` source filter (default: `openphone`)
+
 ## Output
 
 The tool produces two files:
