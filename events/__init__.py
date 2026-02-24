@@ -1,1 +1,1 @@
-from .openphone_new_message_receiver import run_server
+from .op_new_message_receiver import run_server

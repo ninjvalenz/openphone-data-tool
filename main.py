@@ -25,7 +25,7 @@ from typing import List, Optional
 from dotenv import load_dotenv
 
 from services.database import DatabaseConfigError, build_connection_factory_from_env
-from services.openphone_service import OpenPhoneService, OpenPhoneApiError
+from services.op_service import OpenPhoneService, OpenPhoneApiError
 from models.user import User
 from models.phone_number import PhoneNumber
 from models.conversation import Conversation

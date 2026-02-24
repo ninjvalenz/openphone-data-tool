@@ -135,7 +135,7 @@ This project also includes a minimal webhook flow for inbound messages:
 1. Start the webhook receiver:
 
 ```bash
-python events/openphone_new_message_receiver.py
+python events/op_new_message_receiver.py
 ```
 
 By default it listens on `http://0.0.0.0:8080/op_new_message`.
@@ -144,10 +144,12 @@ By default it listens on `http://0.0.0.0:8080/op_new_message`.
 
 ```bash
 OPENPHONE_WEBHOOK_BASE_URL=https://your-public-domain
-OPENPHONE_WEBHOOK_SIGNING_SECRET=your_base64_signing_secret
+OPENPHONE_WEBHOOK_SIGNING_SECRET_SMS=your_base64_signing_secret_for_sms_webhook
+OPENPHONE_WEBHOOK_SIGNING_SECRET_CALLS=your_base64_signing_secret_for_calls_webhook
 ```
 
-`OPENPHONE_WEBHOOK_SIGNING_SECRET` should be the webhook signing key from OpenPhone/Quo.
+`OPENPHONE_WEBHOOK_SIGNING_SECRET_SMS` should be the `key` from your message webhook.
+`OPENPHONE_WEBHOOK_SIGNING_SECRET_CALLS` is reserved for your calls receiver.
 The receiver now verifies the `openphone-signature` header before processing events.
 It also queues validated events and processes them asynchronously in worker threads.
 
@@ -159,14 +161,39 @@ Optional queue tuning env vars:
 3. Create (or reuse) the webhook in OpenPhone:
 
 ```bash
-python -m jobs.setup_message_webhook
+python -m jobs.setup_webhook --type message
 ```
 
 Optional arguments:
 - `--base-url` to override `OPENPHONE_WEBHOOK_BASE_URL`
+- `--path` endpoint path override (default: `op_new_message`)
 - `--label` webhook label (default: `op_new_message`)
 - `--resource-ids` comma-separated phone number IDs (`PN...`) or `*`
 - `--user-id` optional OpenPhone user ID
+- `--delete-existing` delete matching webhook(s) first, then create/reuse
+- `--delete-only` delete matching webhook(s) and exit
+
+## Webhook Setup (Calls)
+
+This project also includes a call webhook setup script:
+- Local endpoint path: `op_new_calls`
+- OpenPhone events subscribed (default): `call.ringing`, `call.completed`, `call.recording.completed`
+
+Create (or reuse) the call webhook in OpenPhone:
+
+```bash
+python -m jobs.setup_webhook --type calls --base-url https://jaiden-eliminative-sparely.ngrok-free.dev
+```
+
+Optional arguments:
+- `--base-url` to override `OPENPHONE_WEBHOOK_BASE_URL`
+- `--path` endpoint path override (default: `op_new_calls`)
+- `--label` webhook label (default: `op_new_calls`)
+- `--events` comma-separated call events (defaults to all three above)
+- `--resource-ids` comma-separated phone number IDs (`PN...`) or `*`
+- `--user-id` optional OpenPhone user ID
+- `--delete-existing` delete matching webhook(s) first, then create/reuse
+- `--delete-only` delete matching webhook(s) and exit
 
 ## Output
 
