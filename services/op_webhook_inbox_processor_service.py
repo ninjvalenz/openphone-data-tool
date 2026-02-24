@@ -192,6 +192,8 @@ class OpenPhoneWebhookInboxProcessorService:
         if not our_phone:
             raise ValueError("Unable to resolve our_phone from payload.")
 
+        guest_id = self._resolve_guest_id(conn=conn, guest_phone=guest_phone)
+
         sent_at = (
             obj.get("createdAt")
             or obj.get("sentAt")
@@ -222,6 +224,7 @@ class OpenPhoneWebhookInboxProcessorService:
         columns = self._get_table_columns(conn=conn, table_name="openphone_sms_messages")
         values_by_column: dict[str, Any] = {
             "openphone_sms_id": sms_id,
+            "guest_id": guest_id,
             "guest_phone": guest_phone,
             "our_phone": our_phone,
             "direction": direction,
@@ -249,6 +252,7 @@ class OpenPhoneWebhookInboxProcessorService:
 
         preferred_column_order = [
             "openphone_sms_id",
+            "guest_id",
             "guest_phone",
             "our_phone",
             "direction",
@@ -263,7 +267,11 @@ class OpenPhoneWebhookInboxProcessorService:
         update_columns = [name for name in insert_columns if name != "openphone_sms_id"]
         placeholders = ", ".join("?" for _ in insert_columns)
         conflict_updates = ", ".join(
-            f"{column_name} = excluded.{column_name}"
+            (
+                "guest_id = COALESCE(excluded.guest_id, openphone_sms_messages.guest_id)"
+                if column_name == "guest_id"
+                else f"{column_name} = excluded.{column_name}"
+            )
             for column_name in update_columns
         )
         sql = f"""
@@ -289,6 +297,42 @@ class OpenPhoneWebhookInboxProcessorService:
             raise RuntimeError("Failed to resolve row id in openphone_sms_messages.")
         return int(row_result["id"])
 
+    def _resolve_guest_id(self, *, conn: Any, guest_phone: str) -> Optional[int]:
+        guests_columns = self._get_table_columns(conn=conn, table_name="guests")
+        if not guests_columns:
+            return None
+
+        required_columns = {"id", "primary_phone"}
+        if not required_columns.issubset(guests_columns):
+            return None
+
+        if "is_current" in guests_columns:
+            row = conn.execute(
+                """
+                SELECT id
+                FROM guests
+                WHERE primary_phone = ?
+                ORDER BY COALESCE(is_current, 0) DESC, id DESC
+                LIMIT 1;
+                """,
+                (guest_phone,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT id
+                FROM guests
+                WHERE primary_phone = ?
+                ORDER BY id DESC
+                LIMIT 1;
+                """,
+                (guest_phone,),
+            ).fetchone()
+
+        if row is None:
+            return None
+        return int(row["id"])
+
     def _upsert_phone_number(
         self,
         *,
@@ -305,6 +349,21 @@ class OpenPhoneWebhookInboxProcessorService:
                 "openphone_phone_numbers is missing required columns: "
                 + ", ".join(missing_required),
             )
+
+        # Do not insert a new row when the same phone_number already exists.
+        existing_by_phone = conn.execute(
+            """
+            SELECT id
+            FROM openphone_phone_numbers
+            WHERE phone_number = ?
+            LIMIT 1;
+            """,
+            (phone_number,),
+        ).fetchone()
+        if existing_by_phone is not None:
+            if "id" not in columns:
+                return None
+            return int(existing_by_phone["id"])
 
         values_by_column = {
             "openphone_number_id": openphone_number_id,

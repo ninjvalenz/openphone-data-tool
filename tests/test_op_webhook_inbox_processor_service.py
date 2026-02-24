@@ -78,6 +78,12 @@ class TestOpenPhoneWebhookInboxProcessorService(unittest.TestCase):
                     property_id INTEGER,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 );
+
+                CREATE TABLE guests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    primary_phone TEXT,
+                    is_current INTEGER DEFAULT 1
+                );
                 """
             )
             conn.commit()
@@ -121,6 +127,17 @@ class TestOpenPhoneWebhookInboxProcessorService(unittest.TestCase):
             return int(cur.lastrowid)
 
     def test_sms_event_is_processed_to_sms_and_phone_number_tables(self) -> None:
+        with self.connection_factory.connect() as conn:
+            guest_id = int(
+                conn.execute(
+                    """
+                    INSERT INTO guests (primary_phone, is_current)
+                    VALUES (?, ?);
+                    """,
+                    ("+15550000000", 1),
+                ).lastrowid
+            )
+
         payload = {
             "type": "message.received",
             "data": {
@@ -160,7 +177,7 @@ class TestOpenPhoneWebhookInboxProcessorService(unittest.TestCase):
 
             sms_row = conn.execute(
                 """
-                SELECT openphone_sms_id, guest_phone, our_phone, direction, body,
+                SELECT openphone_sms_id, guest_id, guest_phone, our_phone, direction, body,
                        openphone_phone_number_id, openphone_user_id, status, updated_at
                 FROM openphone_sms_messages
                 WHERE openphone_sms_id = ?;
@@ -168,6 +185,7 @@ class TestOpenPhoneWebhookInboxProcessorService(unittest.TestCase):
                 ("MSG_PROCESS_1",),
             ).fetchone()
             self.assertIsNotNone(sms_row)
+            self.assertEqual(sms_row["guest_id"], guest_id)
             self.assertEqual(sms_row["guest_phone"], "+15550000000")
             self.assertEqual(sms_row["our_phone"], "+15108227060")
             self.assertEqual(sms_row["direction"], "inbound")
@@ -249,6 +267,112 @@ class TestOpenPhoneWebhookInboxProcessorService(unittest.TestCase):
             self.assertEqual(inbox_row["status"], "failed")
             self.assertEqual(inbox_row["attempts"], 1)
             self.assertIn("Payload is not valid JSON", inbox_row["error_message"])
+
+    def test_phone_number_is_not_inserted_when_number_already_exists(self) -> None:
+        with self.connection_factory.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO openphone_phone_numbers (
+                    openphone_number_id,
+                    phone_number,
+                    label
+                )
+                VALUES (?, ?, ?);
+                """,
+                ("PN_EXISTING", "+15108227060", "existing"),
+            )
+
+        payload = {
+            "type": "message.received",
+            "data": {
+                "object": {
+                    "id": "MSG_PROCESS_3",
+                    "conversationId": "CN_PROCESS_3",
+                    "phoneNumberId": "PN_NEW_SHOULD_NOT_INSERT",
+                    "from": "+15559990000",
+                    "to": ["+15108227060"],
+                    "direction": "incoming",
+                    "text": "duplicate phone number test",
+                    "createdAt": "2026-02-24T14:00:00Z",
+                }
+            },
+        }
+        self._insert_inbox_row(event_type="sms", payload=payload)
+        summary = self.service.process_unprocessed(limit=20, source="openphone").to_dict()
+        self.assertEqual(summary["processed"], 1)
+        self.assertEqual(summary["failed"], 0)
+
+        with self.connection_factory.connect() as conn:
+            total_numbers = conn.execute(
+                "SELECT COUNT(*) FROM openphone_phone_numbers;"
+            ).fetchone()[0]
+            self.assertEqual(total_numbers, 1)
+
+            only_row = conn.execute(
+                """
+                SELECT openphone_number_id, phone_number
+                FROM openphone_phone_numbers
+                LIMIT 1;
+                """
+            ).fetchone()
+            self.assertEqual(only_row["openphone_number_id"], "PN_EXISTING")
+            self.assertEqual(only_row["phone_number"], "+15108227060")
+
+    def test_guest_id_prefers_current_guest_for_matching_phone(self) -> None:
+        with self.connection_factory.connect() as conn:
+            old_guest_id = int(
+                conn.execute(
+                    """
+                    INSERT INTO guests (primary_phone, is_current)
+                    VALUES (?, ?);
+                    """,
+                    ("+17145558834", 0),
+                ).lastrowid
+            )
+            current_guest_id = int(
+                conn.execute(
+                    """
+                    INSERT INTO guests (primary_phone, is_current)
+                    VALUES (?, ?);
+                    """,
+                    ("+17145558834", 1),
+                ).lastrowid
+            )
+
+        payload = {
+            "type": "message.received",
+            "data": {
+                "object": {
+                    "id": "MSG_PROCESS_4",
+                    "conversationId": "CN_PROCESS_4",
+                    "phoneNumberId": "PN_PROCESS_4",
+                    "from": "+17145558834",
+                    "to": ["+15108227060"],
+                    "direction": "incoming",
+                    "text": "guest match test",
+                    "createdAt": "2026-02-24T14:30:00Z",
+                }
+            },
+        }
+        self._insert_inbox_row(event_type="sms", payload=payload)
+
+        summary = self.service.process_unprocessed(limit=20, source="openphone").to_dict()
+        self.assertEqual(summary["processed"], 1)
+        self.assertEqual(summary["failed"], 0)
+
+        with self.connection_factory.connect() as conn:
+            sms_row = conn.execute(
+                """
+                SELECT guest_id, guest_phone
+                FROM openphone_sms_messages
+                WHERE openphone_sms_id = ?;
+                """,
+                ("MSG_PROCESS_4",),
+            ).fetchone()
+            self.assertIsNotNone(sms_row)
+            self.assertEqual(sms_row["guest_phone"], "+17145558834")
+            self.assertEqual(sms_row["guest_id"], current_guest_id)
+            self.assertNotEqual(sms_row["guest_id"], old_guest_id)
 
 
 if __name__ == "__main__":
