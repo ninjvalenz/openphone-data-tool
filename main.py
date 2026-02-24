@@ -24,7 +24,8 @@ from datetime import datetime, timezone
 from typing import List, Optional
 from dotenv import load_dotenv
 
-from services.openphone_service import OpenPhoneService, OpenPhoneApiError
+from services.database import DatabaseConfigError, build_connection_factory_from_env
+from services.op_service import OpenPhoneService, OpenPhoneApiError
 from models.user import User
 from models.phone_number import PhoneNumber
 from models.conversation import Conversation
@@ -46,6 +47,23 @@ load_dotenv()
 API_KEY = os.environ.get("OPENPHONE_API_KEY")
 if not API_KEY:
     raise RuntimeError("OPENPHONE_API_KEY environment variable is not set. Add it to your .env file.")
+
+
+def _log_database_strategy_configuration() -> None:
+    """
+    Log resolved DB strategy without changing the current JSON-only behavior.
+    """
+    try:
+        connection_factory = build_connection_factory_from_env(require_config=False)
+    except DatabaseConfigError as exc:
+        logger.warning("Database configuration is invalid: %s", exc)
+        return
+
+    if connection_factory is None:
+        logger.info("No database configured (DATABASE_URL/OLJ_DB_PATH not set).")
+        return
+
+    logger.info("Database strategy loaded (dialect=%s).", connection_factory.dialect.value)
 
 
 # ------------------------------------------------------------------ #
@@ -421,6 +439,7 @@ if __name__ == "__main__":
         help="Output JSON file for failed items (default: failed_items.json)",
     )
     args = parser.parse_args()
+    _log_database_strategy_configuration()
 
     asyncio.run(
         generate_phone_data_transactions(

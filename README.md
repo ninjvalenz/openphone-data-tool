@@ -59,6 +59,33 @@ Fetches users, phone numbers, conversations, calls (with transcripts), and messa
    OPENPHONE_API_KEY=your_actual_api_key
    ```
 
+6. **Configure database connection (dialect-aware)**
+
+   This project now uses a connection strategy based on `DATABASE_URL`, so the
+   same call sites can support SQLite now and PostgreSQL/MSSQL later.
+
+   SQLite example (current local setup):
+
+   ```
+   DATABASE_URL=sqlite:///D:/Development/OLJ-DB/mockOLJ/property_data.db
+   ```
+
+   PostgreSQL example (future):
+
+   ```
+   DATABASE_URL=postgresql+psycopg://user:password@localhost:5432/openphone_data
+   ```
+
+   MSSQL example (future):
+
+   ```
+   DATABASE_URL=mssql+pyodbc://user:password@localhost:1433/openphone_data?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes
+   ```
+
+   Backwards compatibility:
+   - `OLJ_DB_PATH` is still supported as a SQLite-only fallback.
+   - If both are set, `DATABASE_URL` wins.
+
 ## Usage
 
 **Fetch all users:**
@@ -91,6 +118,14 @@ python main.py --failed-output my_failed_items.json
 python main.py --max-count 10 --output my_data.json --failed-output my_failed_items.json
 ```
 
+## Database Connectivity Check
+
+Run this before wiring write paths, to verify the configured database can be opened:
+
+```bash
+python -m jobs.check_database_connection
+```
+
 ## Webhook Setup (Inbound SMS)
 
 This project also includes a minimal webhook flow for inbound messages:
@@ -100,7 +135,7 @@ This project also includes a minimal webhook flow for inbound messages:
 1. Start the webhook receiver:
 
 ```bash
-python events/openphone_new_message_receiver.py
+python -m events.op_new_message_receiver
 ```
 
 By default it listens on `http://0.0.0.0:8080/op_new_message`.
@@ -109,10 +144,12 @@ By default it listens on `http://0.0.0.0:8080/op_new_message`.
 
 ```bash
 OPENPHONE_WEBHOOK_BASE_URL=https://your-public-domain
-OPENPHONE_WEBHOOK_SIGNING_SECRET=your_base64_signing_secret
+OPENPHONE_WEBHOOK_SIGNING_SECRET_SMS=your_base64_signing_secret_for_sms_webhook
+OPENPHONE_WEBHOOK_SIGNING_SECRET_CALLS=your_base64_signing_secret_for_calls_webhook
 ```
 
-`OPENPHONE_WEBHOOK_SIGNING_SECRET` should be the webhook signing key from OpenPhone/Quo.
+`OPENPHONE_WEBHOOK_SIGNING_SECRET_SMS` should be the `key` from your message webhook.
+`OPENPHONE_WEBHOOK_SIGNING_SECRET_CALLS` is reserved for your calls receiver.
 The receiver now verifies the `openphone-signature` header before processing events.
 It also queues validated events and processes them asynchronously in worker threads.
 
@@ -124,14 +161,54 @@ Optional queue tuning env vars:
 3. Create (or reuse) the webhook in OpenPhone:
 
 ```bash
-python -m jobs.setup_message_webhook
+python -m jobs.setup_webhook --type message
 ```
 
 Optional arguments:
 - `--base-url` to override `OPENPHONE_WEBHOOK_BASE_URL`
+- `--path` endpoint path override (default: `op_new_message`)
 - `--label` webhook label (default: `op_new_message`)
 - `--resource-ids` comma-separated phone number IDs (`PN...`) or `*`
 - `--user-id` optional OpenPhone user ID
+- `--delete-existing` delete matching webhook(s) first, then create/reuse
+- `--delete-only` delete matching webhook(s) and exit
+
+## Webhook Setup (Calls)
+
+This project also includes a call webhook setup script:
+- Local endpoint path: `op_new_calls`
+- OpenPhone events subscribed (default): `call.ringing`, `call.completed`, `call.recording.completed`
+
+Create (or reuse) the call webhook in OpenPhone:
+
+```bash
+python -m jobs.setup_webhook --type calls --base-url https://jaiden-eliminative-sparely.ngrok-free.dev
+```
+
+Optional arguments:
+- `--base-url` to override `OPENPHONE_WEBHOOK_BASE_URL`
+- `--path` endpoint path override (default: `op_new_calls`)
+- `--label` webhook label (default: `op_new_calls`)
+- `--events` comma-separated call events (defaults to all three above)
+- `--resource-ids` comma-separated phone number IDs (`PN...`) or `*`
+- `--user-id` optional OpenPhone user ID
+- `--delete-existing` delete matching webhook(s) first, then create/reuse
+- `--delete-only` delete matching webhook(s) and exit
+
+## Webhook Inbox Processing (OpenPhone)
+
+After the receiver writes rows into `webhook_inbox`, run the processor job to
+move `status='unprocessed'` OpenPhone rows into final tables:
+- `openphone_sms_messages`
+- `openphone_phone_numbers`
+
+```bash
+python -m jobs.process_webhook_inbox --limit 100
+```
+
+Optional arguments:
+- `--limit` max rows per run (default: `100`)
+- `--source` source filter (default: `openphone`)
 
 ## Output
 

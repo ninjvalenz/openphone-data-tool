@@ -12,13 +12,19 @@ import os
 import queue
 import threading
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 
-from constants.openphone_webhook_constants import NEW_MESSAGE_WEBHOOK_PATH
+from constants.op_webhook_constants import NEW_MESSAGE_WEBHOOK_PATH
 from models.webhook_new_message import WebhookNewMessage
-from services.openphone_webhook_service import OpenPhoneWebhookService
+from services.database import DatabaseConfigError, build_connection_factory_from_env
+from services.op_webhook_receiver_service import OpenPhoneWebhookPersistenceService
+from services.op_webhook_service import OpenPhoneWebhookService
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,6 +38,13 @@ DEFAULT_SIGNATURE_TOLERANCE_SECONDS = 300
 DEFAULT_QUEUE_MAXSIZE = 1000
 DEFAULT_WORKER_COUNT = 2
 DEFAULT_ENQUEUE_TIMEOUT_SECONDS = 1.0
+
+
+@dataclass
+class QueuedWebhookEvent:
+    payload: dict[str, Any]
+    new_message: WebhookNewMessage
+    received_at_utc: str
 
 
 def _parse_signature_timestamp(timestamp_raw: str) -> int:
@@ -85,41 +98,53 @@ def _verify_signature(
 
         if hmac.compare_digest(provided_digest, computed_digest):
             return True
+        logger.info(
+            "Signature mismatch (ts=%s, body_len=%s, provided=%s..., computed=%s...).",
+            timestamp_raw,
+            len(raw_body),
+            provided_digest[:10],
+            computed_digest[:10],
+        )
 
     return False
 
 
-def _process_new_message_event(new_message: WebhookNewMessage) -> None:
+def _process_new_message_event(
+    queued_event: QueuedWebhookEvent,
+    persistence_service: OpenPhoneWebhookPersistenceService,
+) -> None:
     """
     Process queued webhook events.
     """
-    logger.info("Processing queued webhook message.")
-    # TODO: Persist to a durable "webhook_inbox" record first so crashes do not
-    # drop events. Suggested fields:
-    #   - event_id (unique/idempotency key)
-    #   - payload_json
-    #   - received_at
-    #   - status (pending, processed, failed_retryable, failed_terminal)
-    #   - attempt_count
-    #   - last_error
-    # TODO: Process business writes from inbox records in a transaction, and
-    # update status/attempt_count on success or failure.
-    # TODO: Add retry with backoff and dead-letter handling for terminal errors.
+    inbox_id = persistence_service.insert_new_message_event(
+        payload=queued_event.payload,
+        new_message=queued_event.new_message,
+        received_at_utc=queued_event.received_at_utc,
+    )
+    logger.info(
+        "Persisted webhook event into webhook_inbox (id=%s, message_id=%s).",
+        inbox_id,
+        queued_event.new_message.id,
+    )
 
 
 def _event_worker(
     event_queue: queue.Queue,
     stop_event: threading.Event,
     worker_name: str,
+    persistence_service: OpenPhoneWebhookPersistenceService,
 ) -> None:
     while not stop_event.is_set():
         try:
-            new_message = event_queue.get(timeout=0.5)
+            queued_event = event_queue.get(timeout=0.5)
         except queue.Empty:
             continue
 
         try:
-            _process_new_message_event(new_message)
+            _process_new_message_event(
+                queued_event=queued_event,
+                persistence_service=persistence_service,
+            )
         except Exception as exc:
             logger.exception("Worker %s failed processing queued message: %s", worker_name, exc)
         finally:
@@ -161,6 +186,7 @@ class OpenPhoneWebhookHandler(BaseHTTPRequestHandler):
             tolerance_seconds=self.signature_tolerance_seconds,
         )
         if not is_valid_signature:
+            logger.info("Rejected webhook due to invalid signature header=%s", signature_header)
             self._send_json(401, {"message": "Invalid webhook signature"})
             return
 
@@ -182,8 +208,13 @@ class OpenPhoneWebhookHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ignored"})
             return
 
+        queued_event = QueuedWebhookEvent(
+            payload=payload,
+            new_message=new_message,
+            received_at_utc=datetime.now(timezone.utc).isoformat(),
+        )
         try:
-            self.event_queue.put(new_message, timeout=self.enqueue_timeout_seconds)
+            self.event_queue.put(queued_event, timeout=self.enqueue_timeout_seconds)
         except queue.Full:
             logger.error("Webhook queue full. Dropping message id=%s", new_message.id)
             self._send_json(503, {"message": "Webhook queue is full"})
@@ -197,23 +228,43 @@ class OpenPhoneWebhookHandler(BaseHTTPRequestHandler):
 
 
 def run_server() -> None:
-    load_dotenv()
+    # Load project .env explicitly so runtime is stable regardless of launch CWD.
+    project_root = Path(__file__).resolve().parents[1]
+    load_dotenv(dotenv_path=project_root / ".env", override=True)
     host = os.environ.get("OPENPHONE_WEBHOOK_HOST", "0.0.0.0")
     port = int(os.environ.get("OPENPHONE_WEBHOOK_PORT", "8080"))
-    signing_secret = os.environ.get("OPENPHONE_WEBHOOK_SIGNING_SECRET")
+
+    try:
+        connection_factory = build_connection_factory_from_env(require_config=True)
+    except DatabaseConfigError as exc:
+        raise RuntimeError(
+            "Database config is required for webhook persistence. Set DATABASE_URL (or OLJ_DB_PATH).",
+        ) from exc
+
+    persistence_service = OpenPhoneWebhookPersistenceService(connection_factory=connection_factory)
+    try:
+        persistence_service.ensure_schema()
+    except NotImplementedError as exc:
+        raise RuntimeError(
+            "Configured database dialect is not implemented for webhook persistence.",
+        ) from exc
+
+    signing_secret = os.environ.get("OPENPHONE_WEBHOOK_SIGNING_SECRET_SMS")
     if not signing_secret:
         raise RuntimeError(
-            "OPENPHONE_WEBHOOK_SIGNING_SECRET is required for webhook signature verification.",
+            "OPENPHONE_WEBHOOK_SIGNING_SECRET_SMS is required for webhook signature verification.",
         )
 
     try:
         signing_key_bytes = base64.b64decode(signing_secret, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise RuntimeError(
-            "OPENPHONE_WEBHOOK_SIGNING_SECRET must be valid base64.",
+            "OPENPHONE_WEBHOOK_SIGNING_SECRET_SMS must be valid base64.",
         ) from exc
     if not signing_key_bytes:
-        raise RuntimeError("OPENPHONE_WEBHOOK_SIGNING_SECRET cannot decode to empty bytes.")
+        raise RuntimeError("OPENPHONE_WEBHOOK_SIGNING_SECRET_SMS cannot decode to empty bytes.")
+    signing_key_fingerprint = hashlib.sha256(signing_key_bytes).hexdigest()[:12]
+    logger.info("Loaded SMS signing key fingerprint=%s.", signing_key_fingerprint)
 
     tolerance_raw = os.environ.get(
         "OPENPHONE_WEBHOOK_SIGNATURE_TOLERANCE_SECONDS",
@@ -269,7 +320,7 @@ def run_server() -> None:
         worker_name = f"webhook-worker-{i + 1}"
         thread = threading.Thread(
             target=_event_worker,
-            args=(event_queue, stop_event, worker_name),
+            args=(event_queue, stop_event, worker_name, persistence_service),
             name=worker_name,
             daemon=True,
         )
@@ -283,9 +334,10 @@ def run_server() -> None:
 
     server = ThreadingHTTPServer((host, port), OpenPhoneWebhookHandler)
     logger.info(
-        "Webhook receiver is running (workers=%s, queue_maxsize=%s).",
+        "Webhook receiver is running (workers=%s, queue_maxsize=%s, db_dialect=%s).",
         worker_count,
         queue_maxsize,
+        connection_factory.dialect.value,
     )
     try:
         server.serve_forever()
