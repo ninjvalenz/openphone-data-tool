@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
@@ -97,6 +98,13 @@ def _verify_signature(
 
         if hmac.compare_digest(provided_digest, computed_digest):
             return True
+        logger.info(
+            "Signature mismatch (ts=%s, body_len=%s, provided=%s..., computed=%s...).",
+            timestamp_raw,
+            len(raw_body),
+            provided_digest[:10],
+            computed_digest[:10],
+        )
 
     return False
 
@@ -178,6 +186,7 @@ class OpenPhoneWebhookHandler(BaseHTTPRequestHandler):
             tolerance_seconds=self.signature_tolerance_seconds,
         )
         if not is_valid_signature:
+            logger.info("Rejected webhook due to invalid signature header=%s", signature_header)
             self._send_json(401, {"message": "Invalid webhook signature"})
             return
 
@@ -219,7 +228,9 @@ class OpenPhoneWebhookHandler(BaseHTTPRequestHandler):
 
 
 def run_server() -> None:
-    load_dotenv()
+    # Load project .env explicitly so runtime is stable regardless of launch CWD.
+    project_root = Path(__file__).resolve().parents[1]
+    load_dotenv(dotenv_path=project_root / ".env", override=True)
     host = os.environ.get("OPENPHONE_WEBHOOK_HOST", "0.0.0.0")
     port = int(os.environ.get("OPENPHONE_WEBHOOK_PORT", "8080"))
 
@@ -252,6 +263,8 @@ def run_server() -> None:
         ) from exc
     if not signing_key_bytes:
         raise RuntimeError("OPENPHONE_WEBHOOK_SIGNING_SECRET_SMS cannot decode to empty bytes.")
+    signing_key_fingerprint = hashlib.sha256(signing_key_bytes).hexdigest()[:12]
+    logger.info("Loaded SMS signing key fingerprint=%s.", signing_key_fingerprint)
 
     tolerance_raw = os.environ.get(
         "OPENPHONE_WEBHOOK_SIGNATURE_TOLERANCE_SECONDS",

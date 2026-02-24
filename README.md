@@ -135,7 +135,7 @@ This project also includes a minimal webhook flow for inbound messages:
 1. Start the webhook receiver:
 
 ```bash
-python events/op_new_message_receiver.py
+python -m events.op_new_message_receiver
 ```
 
 By default it listens on `http://0.0.0.0:8080/op_new_message`.
