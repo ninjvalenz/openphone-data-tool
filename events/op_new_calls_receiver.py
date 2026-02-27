@@ -1,0 +1,393 @@
+"""
+HTTP endpoint for receiving OpenPhone call webhook events.
+Currently processes only `call.completed`.
+"""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import hashlib
+import hmac
+import json
+import logging
+import os
+import queue
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Optional
+
+from dotenv import load_dotenv
+
+from constants.op_webhook_constants import NEW_CALLS_WEBHOOK_PATH
+from services.database import DatabaseConfigError, build_connection_factory_from_env
+from services.op_webhook_receiver_service import OpenPhoneWebhookPersistenceService
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+WEBHOOK_PATH = NEW_CALLS_WEBHOOK_PATH
+SIGNATURE_HEADER = "openphone-signature"
+SUPPORTED_CALL_EVENT_TYPE = "call.completed"
+DEFAULT_SIGNATURE_TOLERANCE_SECONDS = 300
+DEFAULT_QUEUE_MAXSIZE = 1000
+DEFAULT_WORKER_COUNT = 2
+DEFAULT_ENQUEUE_TIMEOUT_SECONDS = 1.0
+
+
+@dataclass
+class QueuedCallWebhookEvent:
+    payload: dict[str, Any]
+    call_id: str
+    conversation_id: Optional[str]
+    phone_number_id: Optional[str]
+    received_at_utc: str
+
+
+def _parse_signature_timestamp(timestamp_raw: str) -> int:
+    """
+    Parse unix timestamp from signature header and normalize to seconds.
+    Quo examples use millisecond precision.
+    """
+    timestamp_int = int(timestamp_raw)
+    if timestamp_int > 1_000_000_000_000:
+        return timestamp_int // 1000
+    return timestamp_int
+
+
+def _verify_signature(
+    signature_header: str,
+    raw_body: bytes,
+    signing_key_bytes: bytes,
+    tolerance_seconds: int,
+) -> bool:
+    """
+    Verify OpenPhone/Quo signature from openphone-signature header.
+
+    Header format:
+      hmac;1;<timestamp>;<signature>
+    Future versions may include multiple signatures separated by commas.
+    """
+    now_seconds = int(time.time())
+    candidates = [value.strip() for value in signature_header.split(",") if value.strip()]
+
+    for candidate in candidates:
+        parts = candidate.split(";")
+        if len(parts) != 4:
+            continue
+
+        scheme, version, timestamp_raw, provided_digest = parts
+        if scheme != "hmac" or version != "1":
+            continue
+
+        try:
+            timestamp_seconds = _parse_signature_timestamp(timestamp_raw)
+        except ValueError:
+            continue
+
+        if tolerance_seconds > 0 and abs(now_seconds - timestamp_seconds) > tolerance_seconds:
+            continue
+
+        signed_data = timestamp_raw.encode("utf-8") + b"." + raw_body
+        computed_digest = base64.b64encode(
+            hmac.new(signing_key_bytes, signed_data, hashlib.sha256).digest()
+        ).decode("utf-8")
+
+        if hmac.compare_digest(provided_digest, computed_digest):
+            return True
+
+    return False
+
+
+def _parse_call_completed_event(payload: dict[str, Any]) -> Optional[QueuedCallWebhookEvent]:
+    """
+    Parse payload for call.completed events.
+    Returns None for non-call.completed events.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("Payload must be a JSON object.")
+
+    event_type = str(payload.get("type") or "").strip().lower()
+    if event_type != SUPPORTED_CALL_EVENT_TYPE:
+        return None
+
+    data = payload.get("data")
+    obj = data.get("object") if isinstance(data, dict) else None
+    if not isinstance(obj, dict):
+        raise ValueError("Payload does not contain call object data.")
+
+    call_id = str(obj.get("id") or obj.get("callId") or "").strip()
+    if not call_id:
+        raise ValueError("Payload is missing call id.")
+
+    conversation_id_raw = obj.get("conversationId")
+    phone_number_id_raw = obj.get("phoneNumberId")
+    conversation_id = (
+        str(conversation_id_raw).strip()
+        if conversation_id_raw is not None and str(conversation_id_raw).strip()
+        else None
+    )
+    phone_number_id = (
+        str(phone_number_id_raw).strip()
+        if phone_number_id_raw is not None and str(phone_number_id_raw).strip()
+        else None
+    )
+
+    return QueuedCallWebhookEvent(
+        payload=payload,
+        call_id=call_id,
+        conversation_id=conversation_id,
+        phone_number_id=phone_number_id,
+        received_at_utc=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+def _process_call_completed_event(
+    queued_event: QueuedCallWebhookEvent,
+    persistence_service: OpenPhoneWebhookPersistenceService,
+) -> None:
+    inbox_id = persistence_service.insert_call_completed_event(
+        payload=queued_event.payload,
+        call_id=queued_event.call_id,
+        conversation_id=queued_event.conversation_id,
+        phone_number_id=queued_event.phone_number_id,
+        received_at_utc=queued_event.received_at_utc,
+    )
+    logger.info(
+        "Persisted call webhook event into webhook_inbox (id=%s, call_id=%s).",
+        inbox_id,
+        queued_event.call_id,
+    )
+
+
+def _event_worker(
+    event_queue: queue.Queue,
+    stop_event: threading.Event,
+    worker_name: str,
+    persistence_service: OpenPhoneWebhookPersistenceService,
+) -> None:
+    while not stop_event.is_set():
+        try:
+            queued_event = event_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+
+        try:
+            _process_call_completed_event(
+                queued_event=queued_event,
+                persistence_service=persistence_service,
+            )
+        except Exception as exc:
+            logger.exception("Worker %s failed processing queued call: %s", worker_name, exc)
+        finally:
+            event_queue.task_done()
+
+
+class OpenPhoneCallsWebhookHandler(BaseHTTPRequestHandler):
+    signing_key_bytes: bytes = b""
+    signature_tolerance_seconds: int = DEFAULT_SIGNATURE_TOLERANCE_SECONDS
+    event_queue: queue.Queue = queue.Queue(maxsize=DEFAULT_QUEUE_MAXSIZE)
+    enqueue_timeout_seconds: float = DEFAULT_ENQUEUE_TIMEOUT_SECONDS
+
+    def _send_json(self, status_code: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self) -> None:
+        request_path = self.path.split("?", 1)[0]
+        if request_path != WEBHOOK_PATH:
+            self._send_json(404, {"message": "Not found"})
+            return
+
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+
+        signature_header = self.headers.get(SIGNATURE_HEADER)
+        if not signature_header:
+            self._send_json(401, {"message": "Missing webhook signature"})
+            return
+
+        is_valid_signature = _verify_signature(
+            signature_header=signature_header,
+            raw_body=raw_body,
+            signing_key_bytes=self.signing_key_bytes,
+            tolerance_seconds=self.signature_tolerance_seconds,
+        )
+        if not is_valid_signature:
+            logger.info("Rejected call webhook due to invalid signature header=%s", signature_header)
+            self._send_json(401, {"message": "Invalid webhook signature"})
+            return
+
+        try:
+            payload = json.loads(raw_body.decode("utf-8"))
+        except json.JSONDecodeError:
+            self._send_json(400, {"message": "Invalid JSON"})
+            return
+
+        try:
+            queued_event = _parse_call_completed_event(payload)
+        except Exception as exc:
+            logger.exception("Failed to parse call webhook payload: %s", exc)
+            self._send_json(400, {"message": "Invalid webhook payload"})
+            return
+
+        if queued_event is None:
+            logger.info("Ignored call webhook type=%s", payload.get("type"))
+            self._send_json(200, {"status": "ignored"})
+            return
+
+        try:
+            self.event_queue.put(queued_event, timeout=self.enqueue_timeout_seconds)
+        except queue.Full:
+            logger.error("Call webhook queue full. Dropping call id=%s", queued_event.call_id)
+            self._send_json(503, {"message": "Webhook queue is full"})
+            return
+
+        self._send_json(200, {"status": "queued"})
+
+    def log_message(self, fmt: str, *args) -> None:
+        # Avoid INFO-level request details to reduce potential PII in logs.
+        logger.debug("HTTP server - %s", fmt % args)
+
+
+def run_server() -> None:
+    # Load project .env explicitly so runtime is stable regardless of launch CWD.
+    project_root = Path(__file__).resolve().parents[1]
+    load_dotenv(dotenv_path=project_root / ".env", override=True)
+    host = os.environ.get("OPENPHONE_WEBHOOK_HOST", "0.0.0.0")
+    port = int(os.environ.get("OPENPHONE_WEBHOOK_PORT", "8080"))
+
+    try:
+        connection_factory = build_connection_factory_from_env(require_config=True)
+    except DatabaseConfigError as exc:
+        raise RuntimeError(
+            "Database config is required for webhook persistence. Set DATABASE_URL (or OLJ_DB_PATH).",
+        ) from exc
+
+    persistence_service = OpenPhoneWebhookPersistenceService(connection_factory=connection_factory)
+    try:
+        persistence_service.ensure_schema()
+    except NotImplementedError as exc:
+        raise RuntimeError(
+            "Configured database dialect is not implemented for webhook persistence.",
+        ) from exc
+
+    signing_secret = os.environ.get("OPENPHONE_WEBHOOK_SIGNING_SECRET_CALLS")
+    if not signing_secret:
+        raise RuntimeError(
+            "OPENPHONE_WEBHOOK_SIGNING_SECRET_CALLS is required for webhook signature verification.",
+        )
+
+    try:
+        signing_key_bytes = base64.b64decode(signing_secret, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise RuntimeError(
+            "OPENPHONE_WEBHOOK_SIGNING_SECRET_CALLS must be valid base64.",
+        ) from exc
+    if not signing_key_bytes:
+        raise RuntimeError("OPENPHONE_WEBHOOK_SIGNING_SECRET_CALLS cannot decode to empty bytes.")
+    signing_key_fingerprint = hashlib.sha256(signing_key_bytes).hexdigest()[:12]
+    logger.info("Loaded call signing key fingerprint=%s.", signing_key_fingerprint)
+
+    tolerance_raw = os.environ.get(
+        "OPENPHONE_WEBHOOK_SIGNATURE_TOLERANCE_SECONDS",
+        str(DEFAULT_SIGNATURE_TOLERANCE_SECONDS),
+    )
+    try:
+        tolerance_seconds = int(tolerance_raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            "OPENPHONE_WEBHOOK_SIGNATURE_TOLERANCE_SECONDS must be an integer.",
+        ) from exc
+    if tolerance_seconds < 0:
+        raise RuntimeError("OPENPHONE_WEBHOOK_SIGNATURE_TOLERANCE_SECONDS must be >= 0.")
+
+    queue_maxsize_raw = os.environ.get(
+        "OPENPHONE_WEBHOOK_QUEUE_MAXSIZE",
+        str(DEFAULT_QUEUE_MAXSIZE),
+    )
+    worker_count_raw = os.environ.get(
+        "OPENPHONE_WEBHOOK_WORKER_COUNT",
+        str(DEFAULT_WORKER_COUNT),
+    )
+    enqueue_timeout_raw = os.environ.get(
+        "OPENPHONE_WEBHOOK_ENQUEUE_TIMEOUT_SECONDS",
+        str(DEFAULT_ENQUEUE_TIMEOUT_SECONDS),
+    )
+
+    try:
+        queue_maxsize = int(queue_maxsize_raw)
+    except ValueError as exc:
+        raise RuntimeError("OPENPHONE_WEBHOOK_QUEUE_MAXSIZE must be an integer.") from exc
+    if queue_maxsize <= 0:
+        raise RuntimeError("OPENPHONE_WEBHOOK_QUEUE_MAXSIZE must be > 0.")
+
+    try:
+        worker_count = int(worker_count_raw)
+    except ValueError as exc:
+        raise RuntimeError("OPENPHONE_WEBHOOK_WORKER_COUNT must be an integer.") from exc
+    if worker_count <= 0:
+        raise RuntimeError("OPENPHONE_WEBHOOK_WORKER_COUNT must be > 0.")
+
+    try:
+        enqueue_timeout_seconds = float(enqueue_timeout_raw)
+    except ValueError as exc:
+        raise RuntimeError("OPENPHONE_WEBHOOK_ENQUEUE_TIMEOUT_SECONDS must be numeric.") from exc
+    if enqueue_timeout_seconds < 0:
+        raise RuntimeError("OPENPHONE_WEBHOOK_ENQUEUE_TIMEOUT_SECONDS must be >= 0.")
+
+    event_queue: queue.Queue = queue.Queue(maxsize=queue_maxsize)
+    stop_event = threading.Event()
+    worker_threads: list[threading.Thread] = []
+    for i in range(worker_count):
+        worker_name = f"calls-webhook-worker-{i + 1}"
+        thread = threading.Thread(
+            target=_event_worker,
+            args=(event_queue, stop_event, worker_name, persistence_service),
+            name=worker_name,
+            daemon=True,
+        )
+        thread.start()
+        worker_threads.append(thread)
+
+    OpenPhoneCallsWebhookHandler.signing_key_bytes = signing_key_bytes
+    OpenPhoneCallsWebhookHandler.signature_tolerance_seconds = tolerance_seconds
+    OpenPhoneCallsWebhookHandler.event_queue = event_queue
+    OpenPhoneCallsWebhookHandler.enqueue_timeout_seconds = enqueue_timeout_seconds
+
+    server = ThreadingHTTPServer((host, port), OpenPhoneCallsWebhookHandler)
+    logger.info(
+        (
+            "Call webhook receiver is running "
+            "(supported_event=%s, workers=%s, queue_maxsize=%s, db_dialect=%s)."
+        ),
+        SUPPORTED_CALL_EVENT_TYPE,
+        worker_count,
+        queue_maxsize,
+        connection_factory.dialect.value,
+    )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("Shutdown requested. Stopping call webhook receiver...")
+    finally:
+        server.shutdown()
+        server.server_close()
+        stop_event.set()
+        for thread in worker_threads:
+            thread.join(timeout=1.0)
+
+
+if __name__ == "__main__":
+    run_server()

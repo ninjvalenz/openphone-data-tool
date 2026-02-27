@@ -178,11 +178,26 @@ Optional arguments:
 This project also includes a call webhook setup script:
 - Local endpoint path: `op_new_calls`
 - OpenPhone events subscribed (default): `call.ringing`, `call.completed`, `call.recording.completed`
+- Receiver currently processes only `call.completed` and ignores other call events.
 
-Create (or reuse) the call webhook in OpenPhone:
+1. Start the calls webhook receiver:
 
 ```bash
-python -m jobs.setup_webhook --type calls --base-url https://jaiden-eliminative-sparely.ngrok-free.dev
+python -m events.op_new_calls_receiver
+```
+
+By default it listens on `http://0.0.0.0:8080/op_new_calls`.
+
+2. Create (or reuse) the call webhook in OpenPhone:
+
+```bash
+python -m jobs.setup_webhook --type calls --events call.completed --base-url https://your-public-domain
+```
+
+Optional local automation (Windows PowerShell):
+
+```powershell
+.\reset_local_calls_webhook.ps1
 ```
 
 Optional arguments:
@@ -198,9 +213,13 @@ Optional arguments:
 ## Webhook Inbox Processing (OpenPhone)
 
 After the receiver writes rows into `webhook_inbox`, run the processor job to
-move `status='unprocessed'` OpenPhone rows into final tables:
+move `status='unprocessed'` OpenPhone rows into final destination tables:
 - `openphone_sms_messages`
-- `openphone_phone_numbers`
+- `openphone_calls`
+
+The processor resolves `guest_id` by matching the inbound sender phone number
+to `guests.primary_phone`. If no match exists, `guest_id` remains null and
+`guest_phone` is still saved.
 
 ```bash
 python -m jobs.process_webhook_inbox --limit 100
@@ -209,6 +228,9 @@ python -m jobs.process_webhook_inbox --limit 100
 Optional arguments:
 - `--limit` max rows per run (default: `100`)
 - `--source` source filter (default: `openphone`)
+
+Optional env var:
+- `OPENPHONE_WEBHOOK_INBOX_MAX_ATTEMPTS` skip rows where `attempts` is greater than or equal to this value
 
 ## Output
 

@@ -12,7 +12,7 @@ from typing import Any, Optional
 from services.database import ConnectionFactory
 
 
-SUPPORTED_OPENPHONE_EVENT_TYPES = {"sms"}
+SUPPORTED_OPENPHONE_EVENT_TYPES = {"sms", "call"}
 
 
 @dataclass
@@ -44,12 +44,19 @@ class OpenPhoneWebhookInboxProcessorService:
         *,
         limit: int = 100,
         source: str = "openphone",
+        max_attempts: Optional[int] = None,
     ) -> WebhookInboxProcessingSummary:
         if limit <= 0:
             raise ValueError("limit must be greater than zero.")
+        if max_attempts is not None and max_attempts <= 0:
+            raise ValueError("max_attempts must be greater than zero when provided.")
 
         summary = WebhookInboxProcessingSummary()
-        row_ids = self._fetch_candidate_ids(limit=limit, source=source)
+        row_ids = self._fetch_candidate_ids(
+            limit=limit,
+            source=source,
+            max_attempts=max_attempts,
+        )
         summary.scanned = len(row_ids)
 
         for row_id in row_ids:
@@ -63,20 +70,35 @@ class OpenPhoneWebhookInboxProcessorService:
 
         return summary
 
-    def _fetch_candidate_ids(self, *, limit: int, source: str) -> list[int]:
+    def _fetch_candidate_ids(
+        self,
+        *,
+        limit: int,
+        source: str,
+        max_attempts: Optional[int],
+    ) -> list[int]:
         with self.connection_factory.connect() as conn:
-            rows = conn.execute(
-                """
+            supported_event_types = sorted(SUPPORTED_OPENPHONE_EVENT_TYPES)
+            event_type_placeholders = ", ".join("?" for _ in supported_event_types)
+            query = f"""
                 SELECT id
                 FROM webhook_inbox
                 WHERE status IN ('unprocessed', 'failed')
                   AND source = ?
-                  AND event_type = 'sms'
+                  AND event_type IN ({event_type_placeholders})
+                """
+            query_params: list[Any] = [source, *supported_event_types]
+            if max_attempts is not None:
+                query += """
+                  AND COALESCE(attempts, 0) < ?
+                """
+                query_params.append(max_attempts)
+            query += """
                 ORDER BY id ASC
                 LIMIT ?;
-                """,
-                (source, limit),
-            ).fetchall()
+                """
+            query_params.append(limit)
+            rows = conn.execute(query, tuple(query_params)).fetchall()
         return [int(row["id"]) for row in rows]
 
     def _process_one_row(self, *, row_id: int, source: str) -> str:
@@ -94,7 +116,8 @@ class OpenPhoneWebhookInboxProcessorService:
                     return "skipped"
                 if row["status"] not in {"unprocessed", "failed"} or row["source"] != source:
                     return "skipped"
-                if str(row["event_type"] or "").strip().lower() != "sms":
+                event_type = str(row["event_type"] or "").strip().lower()
+                if event_type not in SUPPORTED_OPENPHONE_EVENT_TYPES:
                     return "skipped"
 
                 started_at = self._utcnow_iso()
@@ -169,8 +192,15 @@ class OpenPhoneWebhookInboxProcessorService:
         if event_type not in SUPPORTED_OPENPHONE_EVENT_TYPES:
             raise ValueError(f"Unsupported event_type for OpenPhone processor: {event_type}")
 
-        sms_row_id = self._upsert_sms_message(conn=conn, row=row, payload=payload)
-        return ("openphone_sms_messages", sms_row_id)
+        if event_type == "sms":
+            sms_row_id = self._upsert_sms_message(conn=conn, row=row, payload=payload)
+            return ("openphone_sms_messages", sms_row_id)
+
+        if event_type == "call":
+            call_row_id = self._upsert_call(conn=conn, row=row, payload=payload)
+            return ("openphone_calls", call_row_id)
+
+        raise ValueError(f"Unsupported event_type for OpenPhone processor: {event_type}")
 
     def _upsert_sms_message(self, *, conn: Any, row: Any, payload: dict[str, Any]) -> int:
         obj = self._extract_message_object(payload=payload)
@@ -211,15 +241,6 @@ class OpenPhoneWebhookInboxProcessorService:
         user_id = obj.get("userId")
         message_status = obj.get("status")
         updated_at = obj.get("updatedAt")
-        label = obj.get("phoneNumberLabel") or obj.get("label")
-
-        if phone_number_id:
-            self._upsert_phone_number(
-                conn=conn,
-                openphone_number_id=str(phone_number_id),
-                phone_number=our_phone,
-                label=(str(label) if label is not None else None),
-            )
 
         columns = self._get_table_columns(conn=conn, table_name="openphone_sms_messages")
         values_by_column: dict[str, Any] = {
@@ -297,6 +318,161 @@ class OpenPhoneWebhookInboxProcessorService:
             raise RuntimeError("Failed to resolve row id in openphone_sms_messages.")
         return int(row_result["id"])
 
+    def _upsert_call(self, *, conn: Any, row: Any, payload: dict[str, Any]) -> int:
+        obj = self._extract_call_object(payload=payload)
+        call_id = (obj.get("id") or obj.get("callId") or row["message_id"] or "").strip()
+        if not call_id:
+            raise ValueError("Payload is missing call id.")
+
+        direction = self._normalize_call_direction(obj.get("direction"))
+        from_phone = self._normalize_phone(obj.get("from") or obj.get("from_number"))
+        to_phone = self._normalize_phone(self._extract_first_phone(obj.get("to")))
+        if direction == "outbound":
+            guest_phone = to_phone
+            our_phone = from_phone
+        else:
+            guest_phone = from_phone
+            our_phone = to_phone
+        status = self._normalize_phone(obj.get("status"))
+        guest_id = self._resolve_guest_id(conn=conn, guest_phone=guest_phone) if guest_phone else None
+        payload_duration_seconds = self._try_int(
+            obj.get("duration")
+            or obj.get("durationSeconds")
+            or obj.get("durationInSeconds")
+        )
+        started_at = (
+            obj.get("startedAt")
+            or obj.get("createdAt")
+            or row["received_at_utc"]
+            or row["received_at"]
+            or self._utcnow_iso()
+        )
+        answered_at = obj.get("answeredAt")
+        ended_at = obj.get("endedAt") or obj.get("completedAt")
+        calculated_duration_seconds = self._calculate_duration_seconds(
+            answered_at=answered_at,
+            ended_at=ended_at,
+        )
+        duration_seconds = (
+            payload_duration_seconds
+            if payload_duration_seconds is not None
+            else calculated_duration_seconds
+        )
+        created_at = obj.get("createdAt") or started_at
+        completed_at = obj.get("completedAt") or ended_at
+        updated_at = obj.get("updatedAt")
+        conversation_id = obj.get("conversationId") or row["conversation_id"]
+        phone_number_id = obj.get("phoneNumberId") or row["phone_number_id"]
+        user_id = obj.get("userId")
+        recording_url = obj.get("recordingUrl") or obj.get("recording_url")
+        summary = obj.get("summary")
+        call_route = obj.get("callRoute") or obj.get("route")
+        forwarded_from = obj.get("forwardedFrom")
+        forwarded_to = obj.get("forwardedTo")
+        ai_handled_raw = obj.get("aiHandled")
+        ai_handled = str(ai_handled_raw) if ai_handled_raw is not None else None
+
+        columns = self._get_table_columns(conn=conn, table_name="openphone_calls")
+        values_by_column: dict[str, Any] = {
+            "openphone_call_id": call_id,
+            "guest_id": guest_id,
+            "guest_phone": guest_phone,
+            "our_phone": our_phone,
+            "openphone_conversation_id": str(conversation_id) if conversation_id else None,
+            "openphone_phone_number_id": str(phone_number_id) if phone_number_id else None,
+            "openphone_user_id": str(user_id) if user_id else None,
+            "from_phone": from_phone,
+            "to_phone": to_phone,
+            "direction": direction,
+            "status": status,
+            "duration_seconds": duration_seconds,
+            "started_at": str(started_at) if started_at is not None else None,
+            "ended_at": str(ended_at) if ended_at is not None else None,
+            "recording_url": str(recording_url) if recording_url is not None else None,
+            "summary": str(summary) if summary is not None else None,
+            "call_route": str(call_route) if call_route is not None else None,
+            "forwarded_from": str(forwarded_from) if forwarded_from is not None else None,
+            "forwarded_to": str(forwarded_to) if forwarded_to is not None else None,
+            "ai_handled": ai_handled,
+            "answered_at": str(answered_at) if answered_at is not None else None,
+            "updated_at": str(updated_at) if updated_at is not None else None,
+            "created_at": str(created_at) if created_at is not None else None,
+            "completed_at": str(completed_at) if completed_at is not None else None,
+        }
+        required_columns = {"id", "openphone_call_id"}
+        missing_required = sorted(required_columns - columns)
+        if missing_required:
+            raise RuntimeError(
+                "openphone_calls is missing required columns: "
+                + ", ".join(missing_required),
+            )
+        if "guest_phone" in columns and not guest_phone:
+            raise ValueError("Unable to resolve guest_phone from call payload.")
+        if "our_phone" in columns and not our_phone:
+            raise ValueError("Unable to resolve our_phone from call payload.")
+        if "direction" in columns and not direction:
+            raise ValueError("Unable to resolve direction from call payload.")
+        if "started_at" in columns and not started_at:
+            raise ValueError("Unable to resolve started_at from call payload.")
+
+        preferred_column_order = [
+            "openphone_call_id",
+            "guest_id",
+            "guest_phone",
+            "our_phone",
+            "openphone_conversation_id",
+            "openphone_phone_number_id",
+            "openphone_user_id",
+            "from_phone",
+            "to_phone",
+            "direction",
+            "status",
+            "duration_seconds",
+            "started_at",
+            "ended_at",
+            "recording_url",
+            "summary",
+            "call_route",
+            "forwarded_from",
+            "forwarded_to",
+            "ai_handled",
+            "answered_at",
+            "updated_at",
+            "created_at",
+            "completed_at",
+        ]
+        insert_columns = [name for name in preferred_column_order if name in columns]
+        update_columns = [name for name in insert_columns if name != "openphone_call_id"]
+        placeholders = ", ".join("?" for _ in insert_columns)
+        if update_columns:
+            conflict_clause = (
+                "ON CONFLICT(openphone_call_id) DO UPDATE SET "
+                + ", ".join(f"{column_name} = excluded.{column_name}" for column_name in update_columns)
+            )
+        else:
+            conflict_clause = "ON CONFLICT(openphone_call_id) DO NOTHING"
+        sql = f"""
+            INSERT INTO openphone_calls ({", ".join(insert_columns)})
+            VALUES ({placeholders})
+            {conflict_clause};
+            """
+        conn.execute(
+            sql,
+            tuple(values_by_column[column_name] for column_name in insert_columns),
+        )
+
+        row_result = conn.execute(
+            """
+            SELECT id
+            FROM openphone_calls
+            WHERE openphone_call_id = ?;
+            """,
+            (call_id,),
+        ).fetchone()
+        if row_result is None:
+            raise RuntimeError("Failed to resolve row id in openphone_calls.")
+        return int(row_result["id"])
+
     def _resolve_guest_id(self, *, conn: Any, guest_phone: str) -> Optional[int]:
         guests_columns = self._get_table_columns(conn=conn, table_name="guests")
         if not guests_columns:
@@ -333,80 +509,6 @@ class OpenPhoneWebhookInboxProcessorService:
             return None
         return int(row["id"])
 
-    def _upsert_phone_number(
-        self,
-        *,
-        conn: Any,
-        openphone_number_id: str,
-        phone_number: str,
-        label: Optional[str],
-    ) -> Optional[int]:
-        columns = self._get_table_columns(conn=conn, table_name="openphone_phone_numbers")
-        required_columns = {"openphone_number_id", "phone_number"}
-        missing_required = sorted(required_columns - columns)
-        if missing_required:
-            raise RuntimeError(
-                "openphone_phone_numbers is missing required columns: "
-                + ", ".join(missing_required),
-            )
-
-        # Do not insert a new row when the same phone_number already exists.
-        existing_by_phone = conn.execute(
-            """
-            SELECT id
-            FROM openphone_phone_numbers
-            WHERE phone_number = ?
-            LIMIT 1;
-            """,
-            (phone_number,),
-        ).fetchone()
-        if existing_by_phone is not None:
-            if "id" not in columns:
-                return None
-            return int(existing_by_phone["id"])
-
-        values_by_column = {
-            "openphone_number_id": openphone_number_id,
-            "phone_number": phone_number,
-            "label": label,
-        }
-        insert_columns = ["openphone_number_id", "phone_number"]
-        if "label" in columns:
-            insert_columns.append("label")
-
-        placeholders = ", ".join("?" for _ in insert_columns)
-        if "label" in insert_columns:
-            update_sql = (
-                "phone_number = excluded.phone_number, "
-                "label = COALESCE(excluded.label, openphone_phone_numbers.label)"
-            )
-        else:
-            update_sql = "phone_number = excluded.phone_number"
-        sql = f"""
-            INSERT INTO openphone_phone_numbers ({", ".join(insert_columns)})
-            VALUES ({placeholders})
-            ON CONFLICT(openphone_number_id) DO UPDATE SET
-            {update_sql};
-            """
-        conn.execute(
-            sql,
-            tuple(values_by_column[column_name] for column_name in insert_columns),
-        )
-
-        if "id" not in columns:
-            return None
-        row = conn.execute(
-            """
-            SELECT id
-            FROM openphone_phone_numbers
-            WHERE openphone_number_id = ?;
-            """,
-            (openphone_number_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        return int(row["id"])
-
     @staticmethod
     def _extract_message_object(payload: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(payload, dict):
@@ -422,6 +524,22 @@ class OpenPhoneWebhookInboxProcessorService:
             return payload
 
         raise ValueError("Payload does not contain message object data.")
+
+    @staticmethod
+    def _extract_call_object(payload: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise ValueError("Payload must be a JSON object.")
+
+        nested_data = payload.get("data")
+        if isinstance(nested_data, dict):
+            nested_obj = nested_data.get("object")
+            if isinstance(nested_obj, dict):
+                return nested_obj
+
+        if payload.get("id"):
+            return payload
+
+        raise ValueError("Payload does not contain call object data.")
 
     @staticmethod
     def _normalize_direction(raw_direction: Any) -> str:
@@ -448,6 +566,51 @@ class OpenPhoneWebhookInboxProcessorService:
             return None
         value = str(raw_value).strip()
         return value or None
+
+    @staticmethod
+    def _normalize_call_direction(raw_direction: Any) -> Optional[str]:
+        direction = str(raw_direction or "").strip().lower()
+        if not direction:
+            return None
+        if direction in {"incoming", "inbound"}:
+            return "inbound"
+        if direction in {"outgoing", "outbound"}:
+            return "outbound"
+        return direction
+
+    @staticmethod
+    def _try_int(raw_value: Any) -> Optional[int]:
+        if raw_value is None:
+            return None
+        try:
+            return int(raw_value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _parse_iso_datetime(raw_value: Any) -> Optional[datetime]:
+        if raw_value is None:
+            return None
+        value = str(raw_value).strip()
+        if not value:
+            return None
+        normalized = value.replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _calculate_duration_seconds(*, answered_at: Any, ended_at: Any) -> Optional[int]:
+        answered_dt = OpenPhoneWebhookInboxProcessorService._parse_iso_datetime(answered_at)
+        ended_dt = OpenPhoneWebhookInboxProcessorService._parse_iso_datetime(ended_at)
+        if answered_dt is None or ended_dt is None:
+            return None
+
+        diff_seconds = int((ended_dt - answered_dt).total_seconds())
+        if diff_seconds < 0:
+            return None
+        return diff_seconds
 
     @staticmethod
     def _load_payload(*, row: Any) -> dict[str, Any]:

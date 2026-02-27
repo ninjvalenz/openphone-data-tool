@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 
 from dotenv import load_dotenv
 
@@ -21,6 +22,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+MAX_ATTEMPTS_ENV_VAR = "OPENPHONE_WEBHOOK_INBOX_MAX_ATTEMPTS"
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -42,6 +44,21 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_max_attempts_from_env() -> int | None:
+    raw_value = (os.environ.get(MAX_ATTEMPTS_ENV_VAR) or "").strip()
+    if not raw_value:
+        return None
+
+    try:
+        max_attempts = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(f"{MAX_ATTEMPTS_ENV_VAR} must be an integer.") from exc
+
+    if max_attempts <= 0:
+        raise RuntimeError(f"{MAX_ATTEMPTS_ENV_VAR} must be greater than zero.")
+    return max_attempts
+
+
 def run_cli() -> dict[str, int]:
     load_dotenv()
     parser = _build_parser()
@@ -49,6 +66,7 @@ def run_cli() -> dict[str, int]:
 
     if args.limit <= 0:
         raise RuntimeError("--limit must be greater than zero.")
+    max_attempts = _resolve_max_attempts_from_env()
 
     try:
         connection_factory = build_connection_factory_from_env(require_config=True)
@@ -58,12 +76,20 @@ def run_cli() -> dict[str, int]:
         ) from exc
 
     processor = OpenPhoneWebhookInboxProcessorService(connection_factory=connection_factory)
-    summary = processor.process_unprocessed(limit=args.limit, source=args.source)
+    summary = processor.process_unprocessed(
+        limit=args.limit,
+        source=args.source,
+        max_attempts=max_attempts,
+    )
     result = summary.to_dict()
 
     logger.info(
-        "Webhook inbox processing completed (source=%s, scanned=%s, processed=%s, failed=%s, skipped=%s).",
+        (
+            "Webhook inbox processing completed "
+            "(source=%s, max_attempts=%s, scanned=%s, processed=%s, failed=%s, skipped=%s)."
+        ),
         args.source,
+        max_attempts if max_attempts is not None else "none",
         result["scanned"],
         result["processed"],
         result["failed"],
