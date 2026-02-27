@@ -126,7 +126,7 @@ class TestOpenPhoneWebhookInboxProcessorService(unittest.TestCase):
             )
             return int(cur.lastrowid)
 
-    def test_sms_event_is_processed_to_sms_and_phone_number_tables(self) -> None:
+    def test_sms_event_is_processed_to_sms_table_and_guest_lookup(self) -> None:
         with self.connection_factory.connect() as conn:
             guest_id = int(
                 conn.execute(
@@ -194,16 +194,10 @@ class TestOpenPhoneWebhookInboxProcessorService(unittest.TestCase):
             self.assertEqual(sms_row["openphone_user_id"], "US_PROCESS_1")
             self.assertEqual(sms_row["status"], "delivered")
 
-            pn_row = conn.execute(
-                """
-                SELECT openphone_number_id, phone_number
-                FROM openphone_phone_numbers
-                WHERE openphone_number_id = ?;
-                """,
-                ("PN_PROCESS_1",),
-            ).fetchone()
-            self.assertIsNotNone(pn_row)
-            self.assertEqual(pn_row["phone_number"], "+15108227060")
+            phone_number_rows = conn.execute(
+                "SELECT COUNT(*) FROM openphone_phone_numbers;"
+            ).fetchone()[0]
+            self.assertEqual(phone_number_rows, 0)
 
     def test_sms_event_type_is_supported_and_normalized_for_outbound_direction(self) -> None:
         payload = {
@@ -268,7 +262,7 @@ class TestOpenPhoneWebhookInboxProcessorService(unittest.TestCase):
             self.assertEqual(inbox_row["attempts"], 1)
             self.assertIn("Payload is not valid JSON", inbox_row["error_message"])
 
-    def test_phone_number_is_not_inserted_when_number_already_exists(self) -> None:
+    def test_openphone_phone_numbers_table_is_not_written_by_processor(self) -> None:
         with self.connection_factory.connect() as conn:
             conn.execute(
                 """
@@ -373,6 +367,89 @@ class TestOpenPhoneWebhookInboxProcessorService(unittest.TestCase):
             self.assertEqual(sms_row["guest_phone"], "+17145558834")
             self.assertEqual(sms_row["guest_id"], current_guest_id)
             self.assertNotEqual(sms_row["guest_id"], old_guest_id)
+
+    def test_max_attempts_skips_rows_that_reached_threshold(self) -> None:
+        retryable_payload = {
+            "type": "message.received",
+            "data": {
+                "object": {
+                    "id": "MSG_PROCESS_RETRYABLE",
+                    "conversationId": "CN_PROCESS_RETRYABLE",
+                    "phoneNumberId": "PN_PROCESS_RETRYABLE",
+                    "from": "+15554440000",
+                    "to": ["+15108227060"],
+                    "direction": "incoming",
+                    "text": "retryable message",
+                    "createdAt": "2026-02-24T15:00:00Z",
+                }
+            },
+        }
+        capped_payload = {
+            "type": "message.received",
+            "data": {
+                "object": {
+                    "id": "MSG_PROCESS_CAPPED",
+                    "conversationId": "CN_PROCESS_CAPPED",
+                    "phoneNumberId": "PN_PROCESS_CAPPED",
+                    "from": "+15553330000",
+                    "to": ["+15108227060"],
+                    "direction": "incoming",
+                    "text": "capped message",
+                    "createdAt": "2026-02-24T15:10:00Z",
+                }
+            },
+        }
+        retryable_inbox_id = self._insert_inbox_row(event_type="sms", payload=retryable_payload)
+        capped_inbox_id = self._insert_inbox_row(event_type="sms", payload=capped_payload)
+
+        with self.connection_factory.connect() as conn:
+            conn.execute(
+                "UPDATE webhook_inbox SET status = 'failed', attempts = 2 WHERE id = ?;",
+                (retryable_inbox_id,),
+            )
+            conn.execute(
+                "UPDATE webhook_inbox SET status = 'failed', attempts = 3 WHERE id = ?;",
+                (capped_inbox_id,),
+            )
+
+        summary = self.service.process_unprocessed(
+            limit=20,
+            source="openphone",
+            max_attempts=3,
+        ).to_dict()
+        self.assertEqual(summary["scanned"], 1)
+        self.assertEqual(summary["processed"], 1)
+        self.assertEqual(summary["failed"], 0)
+        self.assertEqual(summary["skipped"], 0)
+
+        with self.connection_factory.connect() as conn:
+            retryable_row = conn.execute(
+                "SELECT status FROM webhook_inbox WHERE id = ?;",
+                (retryable_inbox_id,),
+            ).fetchone()
+            self.assertEqual(retryable_row["status"], "processed")
+
+            capped_row = conn.execute(
+                "SELECT status, attempts FROM webhook_inbox WHERE id = ?;",
+                (capped_inbox_id,),
+            ).fetchone()
+            self.assertEqual(capped_row["status"], "failed")
+            self.assertEqual(capped_row["attempts"], 3)
+
+            retryable_sms = conn.execute(
+                "SELECT id FROM openphone_sms_messages WHERE openphone_sms_id = ?;",
+                ("MSG_PROCESS_RETRYABLE",),
+            ).fetchone()
+            capped_sms = conn.execute(
+                "SELECT id FROM openphone_sms_messages WHERE openphone_sms_id = ?;",
+                ("MSG_PROCESS_CAPPED",),
+            ).fetchone()
+            self.assertIsNotNone(retryable_sms)
+            self.assertIsNone(capped_sms)
+
+    def test_process_unprocessed_rejects_non_positive_max_attempts(self) -> None:
+        with self.assertRaises(ValueError):
+            self.service.process_unprocessed(limit=20, source="openphone", max_attempts=0)
 
 
 if __name__ == "__main__":

@@ -198,9 +198,12 @@ Optional arguments:
 ## Webhook Inbox Processing (OpenPhone)
 
 After the receiver writes rows into `webhook_inbox`, run the processor job to
-move `status='unprocessed'` OpenPhone rows into final tables:
+move `status='unprocessed'` OpenPhone rows into the final SMS table:
 - `openphone_sms_messages`
-- `openphone_phone_numbers`
+
+The processor resolves `guest_id` by matching the inbound sender phone number
+to `guests.primary_phone`. If no match exists, `guest_id` remains null and
+`guest_phone` is still saved.
 
 ```bash
 python -m jobs.process_webhook_inbox --limit 100
@@ -209,6 +212,9 @@ python -m jobs.process_webhook_inbox --limit 100
 Optional arguments:
 - `--limit` max rows per run (default: `100`)
 - `--source` source filter (default: `openphone`)
+
+Optional env var:
+- `OPENPHONE_WEBHOOK_INBOX_MAX_ATTEMPTS` skip rows where `attempts` is greater than or equal to this value
 
 ## Output
 

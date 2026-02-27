@@ -44,12 +44,19 @@ class OpenPhoneWebhookInboxProcessorService:
         *,
         limit: int = 100,
         source: str = "openphone",
+        max_attempts: Optional[int] = None,
     ) -> WebhookInboxProcessingSummary:
         if limit <= 0:
             raise ValueError("limit must be greater than zero.")
+        if max_attempts is not None and max_attempts <= 0:
+            raise ValueError("max_attempts must be greater than zero when provided.")
 
         summary = WebhookInboxProcessingSummary()
-        row_ids = self._fetch_candidate_ids(limit=limit, source=source)
+        row_ids = self._fetch_candidate_ids(
+            limit=limit,
+            source=source,
+            max_attempts=max_attempts,
+        )
         summary.scanned = len(row_ids)
 
         for row_id in row_ids:
@@ -63,20 +70,33 @@ class OpenPhoneWebhookInboxProcessorService:
 
         return summary
 
-    def _fetch_candidate_ids(self, *, limit: int, source: str) -> list[int]:
+    def _fetch_candidate_ids(
+        self,
+        *,
+        limit: int,
+        source: str,
+        max_attempts: Optional[int],
+    ) -> list[int]:
         with self.connection_factory.connect() as conn:
-            rows = conn.execute(
-                """
+            query = """
                 SELECT id
                 FROM webhook_inbox
                 WHERE status IN ('unprocessed', 'failed')
                   AND source = ?
                   AND event_type = 'sms'
+                """
+            query_params: list[Any] = [source]
+            if max_attempts is not None:
+                query += """
+                  AND COALESCE(attempts, 0) < ?
+                """
+                query_params.append(max_attempts)
+            query += """
                 ORDER BY id ASC
                 LIMIT ?;
-                """,
-                (source, limit),
-            ).fetchall()
+                """
+            query_params.append(limit)
+            rows = conn.execute(query, tuple(query_params)).fetchall()
         return [int(row["id"]) for row in rows]
 
     def _process_one_row(self, *, row_id: int, source: str) -> str:
@@ -211,15 +231,6 @@ class OpenPhoneWebhookInboxProcessorService:
         user_id = obj.get("userId")
         message_status = obj.get("status")
         updated_at = obj.get("updatedAt")
-        label = obj.get("phoneNumberLabel") or obj.get("label")
-
-        if phone_number_id:
-            self._upsert_phone_number(
-                conn=conn,
-                openphone_number_id=str(phone_number_id),
-                phone_number=our_phone,
-                label=(str(label) if label is not None else None),
-            )
 
         columns = self._get_table_columns(conn=conn, table_name="openphone_sms_messages")
         values_by_column: dict[str, Any] = {
@@ -329,80 +340,6 @@ class OpenPhoneWebhookInboxProcessorService:
                 (guest_phone,),
             ).fetchone()
 
-        if row is None:
-            return None
-        return int(row["id"])
-
-    def _upsert_phone_number(
-        self,
-        *,
-        conn: Any,
-        openphone_number_id: str,
-        phone_number: str,
-        label: Optional[str],
-    ) -> Optional[int]:
-        columns = self._get_table_columns(conn=conn, table_name="openphone_phone_numbers")
-        required_columns = {"openphone_number_id", "phone_number"}
-        missing_required = sorted(required_columns - columns)
-        if missing_required:
-            raise RuntimeError(
-                "openphone_phone_numbers is missing required columns: "
-                + ", ".join(missing_required),
-            )
-
-        # Do not insert a new row when the same phone_number already exists.
-        existing_by_phone = conn.execute(
-            """
-            SELECT id
-            FROM openphone_phone_numbers
-            WHERE phone_number = ?
-            LIMIT 1;
-            """,
-            (phone_number,),
-        ).fetchone()
-        if existing_by_phone is not None:
-            if "id" not in columns:
-                return None
-            return int(existing_by_phone["id"])
-
-        values_by_column = {
-            "openphone_number_id": openphone_number_id,
-            "phone_number": phone_number,
-            "label": label,
-        }
-        insert_columns = ["openphone_number_id", "phone_number"]
-        if "label" in columns:
-            insert_columns.append("label")
-
-        placeholders = ", ".join("?" for _ in insert_columns)
-        if "label" in insert_columns:
-            update_sql = (
-                "phone_number = excluded.phone_number, "
-                "label = COALESCE(excluded.label, openphone_phone_numbers.label)"
-            )
-        else:
-            update_sql = "phone_number = excluded.phone_number"
-        sql = f"""
-            INSERT INTO openphone_phone_numbers ({", ".join(insert_columns)})
-            VALUES ({placeholders})
-            ON CONFLICT(openphone_number_id) DO UPDATE SET
-            {update_sql};
-            """
-        conn.execute(
-            sql,
-            tuple(values_by_column[column_name] for column_name in insert_columns),
-        )
-
-        if "id" not in columns:
-            return None
-        row = conn.execute(
-            """
-            SELECT id
-            FROM openphone_phone_numbers
-            WHERE openphone_number_id = ?;
-            """,
-            (openphone_number_id,),
-        ).fetchone()
         if row is None:
             return None
         return int(row["id"])
