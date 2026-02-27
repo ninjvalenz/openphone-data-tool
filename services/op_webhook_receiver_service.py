@@ -26,9 +26,12 @@ class OpenPhoneWebhookPersistenceService:
         """
         Keep event_type compatible with legacy webhook_inbox CHECK constraints.
         """
-        if event_type == "message.received":
+        normalized = str(event_type or "").strip().lower()
+        if normalized == "message.received":
             return "sms"
-        return event_type or "sms"
+        if normalized.startswith("call."):
+            return "call"
+        return normalized or "sms"
 
     def ensure_schema(self) -> None:
         """
@@ -146,6 +149,18 @@ class OpenPhoneWebhookPersistenceService:
                 )
                 existing_columns.add(column_name)
 
+        if "created_at_utc" in existing_columns:
+            conn.execute(
+                """
+                UPDATE webhook_inbox
+                SET created_at_utc = COALESCE(
+                    NULLIF(received_at_utc, ''),
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                )
+                WHERE created_at_utc IS NULL OR created_at_utc = '';
+                """
+            )
+
         required_columns = {"provider", "event_type", "payload_json", "received_at_utc"}
         missing_required = sorted(required_columns - existing_columns)
         if missing_required:
@@ -166,10 +181,50 @@ class OpenPhoneWebhookPersistenceService:
         for compatibility with legacy schemas.
         Returns inserted row id.
         """
+        return self._insert_event(
+            payload=payload,
+            event_type=payload.get("type"),
+            event_id=new_message.id or None,
+            conversation_id=new_message.conversationId,
+            phone_number_id=new_message.phoneNumberId,
+            received_at_utc=received_at_utc,
+        )
+
+    def insert_call_completed_event(
+        self,
+        payload: Dict[str, Any],
+        call_id: str,
+        conversation_id: Optional[str] = None,
+        phone_number_id: Optional[str] = None,
+        received_at_utc: Optional[str] = None,
+    ) -> int:
+        """
+        Insert one call.completed event row into webhook_inbox.
+        Returns inserted row id.
+        """
+        return self._insert_event(
+            payload=payload,
+            event_type=payload.get("type") or "call.completed",
+            event_id=call_id,
+            conversation_id=conversation_id,
+            phone_number_id=phone_number_id,
+            received_at_utc=received_at_utc,
+        )
+
+    def _insert_event(
+        self,
+        *,
+        payload: Dict[str, Any],
+        event_type: Optional[str],
+        event_id: Optional[str],
+        conversation_id: Optional[str],
+        phone_number_id: Optional[str],
+        received_at_utc: Optional[str],
+    ) -> int:
         received_at = received_at_utc or datetime.now(timezone.utc).isoformat()
         payload_json = json.dumps(payload, ensure_ascii=False)
         event_type_for_storage = self._normalize_event_type_for_storage(
-            payload.get("type"),
+            event_type,
         )
 
         with self.connection_factory.connect() as conn:
@@ -180,12 +235,13 @@ class OpenPhoneWebhookPersistenceService:
                 "provider": "openphone",
                 "source": "openphone",
                 "event_type": event_type_for_storage,
-                "message_id": new_message.id or None,
-                "conversation_id": new_message.conversationId,
-                "phone_number_id": new_message.phoneNumberId,
+                "message_id": event_id,
+                "conversation_id": conversation_id,
+                "phone_number_id": phone_number_id,
                 "payload_json": payload_json,
                 "raw_payload": payload_json,
                 "received_at_utc": received_at,
+                "created_at_utc": received_at,
                 "received_at": received_at,
             }
             column_order = [
@@ -198,6 +254,7 @@ class OpenPhoneWebhookPersistenceService:
                 "payload_json",
                 "raw_payload",
                 "received_at_utc",
+                "created_at_utc",
                 "received_at",
             ]
             insert_columns = [name for name in column_order if name in existing_columns]

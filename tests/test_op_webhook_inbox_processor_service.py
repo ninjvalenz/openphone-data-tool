@@ -70,6 +70,29 @@ class TestOpenPhoneWebhookInboxProcessorService(unittest.TestCase):
                     updated_at DATETIME
                 );
 
+                CREATE TABLE openphone_calls (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    openphone_call_id TEXT UNIQUE,
+                    guest_id INTEGER,
+                    guest_phone TEXT NOT NULL,
+                    our_phone TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    duration_seconds INTEGER,
+                    started_at DATETIME NOT NULL,
+                    ended_at DATETIME,
+                    recording_url TEXT,
+                    summary TEXT,
+                    openphone_phone_number_id TEXT,
+                    openphone_user_id TEXT,
+                    status TEXT,
+                    answered_at DATETIME,
+                    call_route TEXT,
+                    forwarded_from TEXT,
+                    forwarded_to TEXT,
+                    ai_handled TEXT,
+                    updated_at DATETIME
+                );
+
                 CREATE TABLE openphone_phone_numbers (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     openphone_number_id TEXT UNIQUE NOT NULL,
@@ -198,6 +221,105 @@ class TestOpenPhoneWebhookInboxProcessorService(unittest.TestCase):
                 "SELECT COUNT(*) FROM openphone_phone_numbers;"
             ).fetchone()[0]
             self.assertEqual(phone_number_rows, 0)
+
+    def test_call_event_is_processed_to_calls_table(self) -> None:
+        payload = {
+            "type": "call.completed",
+            "data": {
+                "object": {
+                    "id": "CA_PROCESS_1",
+                    "conversationId": "CN_CALL_1",
+                    "phoneNumberId": "PN_CALL_1",
+                    "userId": "US_CALL_1",
+                    "from": "+15550001111",
+                    "to": ["+15550002222"],
+                    "direction": "incoming",
+                    "status": "completed",
+                    "duration": 87,
+                    "createdAt": "2026-02-24T16:00:00Z",
+                    "answeredAt": "2026-02-24T16:00:10Z",
+                    "completedAt": "2026-02-24T16:01:27Z",
+                }
+            },
+        }
+        inbox_id = self._insert_inbox_row(event_type="call", payload=payload)
+
+        summary = self.service.process_unprocessed(limit=20, source="openphone").to_dict()
+        self.assertEqual(summary["scanned"], 1)
+        self.assertEqual(summary["processed"], 1)
+        self.assertEqual(summary["failed"], 0)
+        self.assertEqual(summary["skipped"], 0)
+
+        with self.connection_factory.connect() as conn:
+            inbox_row = conn.execute(
+                "SELECT status, processed_table, processed_row_id, attempts, error_message FROM webhook_inbox WHERE id = ?",
+                (inbox_id,),
+            ).fetchone()
+            self.assertEqual(inbox_row["status"], "processed")
+            self.assertEqual(inbox_row["processed_table"], "openphone_calls")
+            self.assertIsNotNone(inbox_row["processed_row_id"])
+            self.assertEqual(inbox_row["attempts"], 0)
+            self.assertIsNone(inbox_row["error_message"])
+
+            call_row = conn.execute(
+                """
+                SELECT openphone_call_id, openphone_phone_number_id,
+                       openphone_user_id, guest_phone, our_phone, direction, status,
+                       duration_seconds, started_at, answered_at, ended_at
+                FROM openphone_calls
+                WHERE openphone_call_id = ?;
+                """,
+                ("CA_PROCESS_1",),
+            ).fetchone()
+            self.assertIsNotNone(call_row)
+            self.assertEqual(call_row["openphone_call_id"], "CA_PROCESS_1")
+            self.assertEqual(call_row["openphone_phone_number_id"], "PN_CALL_1")
+            self.assertEqual(call_row["openphone_user_id"], "US_CALL_1")
+            self.assertEqual(call_row["guest_phone"], "+15550001111")
+            self.assertEqual(call_row["our_phone"], "+15550002222")
+            self.assertEqual(call_row["direction"], "inbound")
+            self.assertEqual(call_row["status"], "completed")
+            self.assertEqual(call_row["duration_seconds"], 87)
+            self.assertEqual(call_row["started_at"], "2026-02-24T16:00:00Z")
+            self.assertEqual(call_row["answered_at"], "2026-02-24T16:00:10Z")
+            self.assertEqual(call_row["ended_at"], "2026-02-24T16:01:27Z")
+
+    def test_call_duration_is_calculated_from_answered_at_and_ended_at(self) -> None:
+        payload = {
+            "type": "call.completed",
+            "data": {
+                "object": {
+                    "id": "CA_PROCESS_DURATION_1",
+                    "phoneNumberId": "PN_CALL_DURATION_1",
+                    "from": "+15550001111",
+                    "to": ["+15550002222"],
+                    "direction": "incoming",
+                    "status": "completed",
+                    "createdAt": "2026-02-27T20:15:00Z",
+                    "answeredAt": "2026-02-27T20:15:05Z",
+                    "endedAt": "2026-02-27T20:16:30Z",
+                }
+            },
+        }
+        self._insert_inbox_row(event_type="call", payload=payload)
+
+        summary = self.service.process_unprocessed(limit=20, source="openphone").to_dict()
+        self.assertEqual(summary["processed"], 1)
+        self.assertEqual(summary["failed"], 0)
+
+        with self.connection_factory.connect() as conn:
+            call_row = conn.execute(
+                """
+                SELECT duration_seconds, answered_at, ended_at
+                FROM openphone_calls
+                WHERE openphone_call_id = ?;
+                """,
+                ("CA_PROCESS_DURATION_1",),
+            ).fetchone()
+            self.assertIsNotNone(call_row)
+            self.assertEqual(call_row["duration_seconds"], 85)
+            self.assertEqual(call_row["answered_at"], "2026-02-27T20:15:05Z")
+            self.assertEqual(call_row["ended_at"], "2026-02-27T20:16:30Z")
 
     def test_sms_event_type_is_supported_and_normalized_for_outbound_direction(self) -> None:
         payload = {
